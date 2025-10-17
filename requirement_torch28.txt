@@ -1,0 +1,30 @@
+
+# ---- Training loop / metrics ----
+pytorch-lightning==2.4.0
+torchmetrics==1.4.0
+tqdm>=4.66
+
+# ---- HuggingFace stack (stable with torch2.x) ----
+transformers==4.41.2
+tokenizers==0.19.1
+accelerate==0.28.0
+datasets==2.14.6
+evaluate==0.4.1
+huggingface_hub>=0.20,<0.24
+
+# ---- Evaluation / NLP extras ----
+bert-score==0.3.13
+rouge-score>=0.1.2
+sacrebleu>=2.3
+sentencepiece>=0.1.99
+
+# ---- Audio / Vision (按需) ----
+librosa>=0.10.1
+soundfile>=0.12
+opencv-python>=4.8
+timm>=0.9.12
+
+# ---- SciPy stack ----
+scipy>=1.10.0
+pandas>=2.0.3
+protobuf<5
