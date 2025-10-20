@@ -203,7 +203,7 @@ class PadCollate():
                 label_text = b.get('label_text', '')
                 contexts.append(b.get('contexts', b.get('ctx_text', '')))
 
-                # Tokenize context (no special tokens added; we already have <s>/</s> if you inserted them upstream)
+                # --- tokenize context (ctx) ---
                 enc_ctx = tokenizer(
                     ctx_text,
                     padding=False,
@@ -212,21 +212,20 @@ class PadCollate():
                     add_special_tokens=False,
                     return_tensors='pt'
                 )
-                ids = enc_ctx.input_ids[0].to(torch.long)
+                ids_ctx = enc_ctx.input_ids[0].to(torch.long)
 
-                # Build token_type_ids by scanning for speaker tokens in the id sequence
-                # Default current speaker = sp1
+                # build token_type_ids for ctx by scanning speaker tokens
                 cur_sp = sp1_id
-                tt = torch.empty_like(ids)
-                for k, tid in enumerate(ids.tolist()):
+                tt_ctx = torch.empty_like(ids_ctx)
+                for k, tid in enumerate(ids_ctx.tolist()):
                     if sp1_tid is not None and tid == sp1_tid:
                         cur_sp = sp1_id
                     elif sp2_tid is not None and tid == sp2_tid:
                         cur_sp = sp2_id
-                    tt[k] = cur_sp
+                    tt_ctx[k] = cur_sp
 
-                # Tokenize label/response
-                enc_lbl = tokenizer(
+                # --- tokenize response (resp) ---
+                enc_resp = tokenizer(
                     label_text,
                     padding=False,
                     truncation=True,
@@ -234,22 +233,37 @@ class PadCollate():
                     add_special_tokens=False,
                     return_tensors='pt'
                 )
-                lbl = enc_lbl.input_ids[0].to(torch.long)
+                ids_resp = enc_resp.input_ids[0].to(torch.long)
 
-                # Align lengths: left-pad labels with -100 to match input_ids; if label longer, extend input/eos + token types
-                if ids.size(0) >= lbl.size(0):
-                    pad_len = ids.size(0) - lbl.size(0)
-                    if pad_len > 0:
-                        lbl = torch.cat([torch.full((pad_len,), -100, dtype=torch.long), lbl], dim=0)
-                else:
-                    add = lbl.size(0) - ids.size(0)
-                    ids = torch.cat([ids, torch.full((add,), eos_id, dtype=torch.long)], dim=0)
-                    # extend token types with the last seen speaker id
-                    tt = torch.cat([tt, tt[-1:].repeat(add)], dim=0)
+                # --- smart truncation to keep full response supervised ---
+                # We prefer to trim from the LEFT of ctx so that the entire response stays
+                total_len = ids_ctx.size(0) + ids_resp.size(0)
+                if total_len > max_len:
+                    overflow = total_len - max_len
+                    if overflow < ids_ctx.size(0):
+                        ids_ctx = ids_ctx[overflow:]
+                        tt_ctx = tt_ctx[overflow:]
+                    else:
+                        # ctx fully removed; keep the last max_len tokens of resp
+                        cut = overflow - ids_ctx.size(0)
+                        ids_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
+                        tt_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
+                        ids_resp = ids_resp[-max_len:]
 
-                input_ids_list.append(ids)
-                token_type_ids_list.append(tt)
-                labels_list.append(lbl)
+                # --- concat inputs; labels only supervise response ---
+                input_ids_full = torch.cat([ids_ctx, ids_resp], dim=0)
+                tt_full = torch.cat([tt_ctx, (
+                    tt_ctx[-1:] if tt_ctx.numel() > 0 else torch.tensor([sp1_id], dtype=torch.long)).repeat(
+                    ids_resp.size(0))], dim=0)
+
+                labels_full = torch.cat([
+                    torch.full((ids_ctx.size(0),), -100, dtype=torch.long),
+                    ids_resp.clone()
+                ], dim=0)
+
+                input_ids_list.append(input_ids_full)
+                token_type_ids_list.append(tt_full)
+                labels_list.append(labels_full)
 
                 # Audio/Video features → (D,) then repeat per-token to align with ERGM expectation
                 # ---- audio ----
@@ -267,7 +281,7 @@ class PadCollate():
                     vf = torch.zeros(v_dim, dtype=torch.float32)
                 else:
                     vf = _stack_1d(vf_src)
-                seq_len = ids.size(0)
+                seq_len = input_ids_full.size(0)
                 imgs.append([vf.clone() for _ in range(seq_len)])
                 auds.append([af.clone() for _ in range(seq_len)])
 

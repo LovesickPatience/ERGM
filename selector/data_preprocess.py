@@ -305,8 +305,8 @@ class IEMOCAPDialoguePKLDataset(Dataset):
                         v = v.mean(dim=0)
                         v_feats.append(v)
                 # stack to (Lc, D)
-                a_stack = torch.stack(a_feats, dim=0) if a_feats else torch.zeros(1, 512)
-                v_stack = torch.stack(v_feats, dim=0) if v_feats else torch.zeros(1, 512)
+                a_stack = torch.stack(a_feats, dim=0) if a_feats else torch.zeros(1, 64)
+                v_stack = torch.stack(v_feats, dim=0) if v_feats else torch.zeros(1, 64)
 
                 self.samples.append({
                     "dialogue_id": dlg_id,

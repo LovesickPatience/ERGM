@@ -258,7 +258,8 @@ class Manager:
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
                     labels=lm_labels, emotion_labels=emotion_labels,
-                    imgs=imgs, auds=auds,
+                    imgs=imgs,
+                    # auds=auds,
                 )
 
                 loss = outputs.loss
@@ -344,7 +345,9 @@ class Manager:
 
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
-                    labels=lm_labels, emotion_labels=emotion_labels
+                    labels=lm_labels, emotion_labels=emotion_labels,
+                    imgs=imgs,
+                    # auds=auds
                 )
 
                 valid_total_losses.append(outputs.loss.item())

@@ -13,8 +13,8 @@ from torch.nn import functional as F
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPastAndCrossAttentions,
-    CausalLMOutputWithCrossAttentions,
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
@@ -46,10 +46,10 @@ GPT2_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 @dataclass
-class CausalLMOutputWithEmotionClassification(CausalLMOutputWithCrossAttentions):
+class CausalLMOutputWithEmotionClassification(CausalLMOutputWithPast):
     """
     Base class for causal language model (or autoregressive) outputs.
-    This class extends CausalLMOutputWithCrossAttentions to include emotion classification logits.
+    This class extends CausalLMOutputWithPast to include emotion classification logits.
     """
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
@@ -57,7 +57,6 @@ class CausalLMOutputWithEmotionClassification(CausalLMOutputWithCrossAttentions)
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
-    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
 class GPT2Attention(nn.Module):
@@ -150,7 +149,7 @@ class GPT2Attention(nn.Module):
     def _upcast_and_reordered_attn(self, query, key, value, attention_mask=None, head_mask=None):
         bsz, num_heads, q_seq_len, dk = query.size()
         _, _, k_seq_len, _ = key.size()
-        
+
         attn_weights = torch.empty(bsz * num_heads, q_seq_len, k_seq_len, dtype=torch.float32, device=query.device)
 
         scale_factor = 1.0
@@ -272,14 +271,11 @@ class GPT2Block(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
-        config.add_cross_attention = True
+        config.add_cross_attention = False
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPT2Attention(config, layer_idx=layer_idx)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        if config.add_cross_attention:
-            self.crossattention = GPT2Attention(config, is_cross_attention=True, layer_idx=layer_idx)
-            self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         self.mlp = GPT2MLP(inner_dim, config)
 
@@ -289,8 +285,6 @@ class GPT2Block(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
@@ -308,25 +302,6 @@ class GPT2Block(nn.Module):
         outputs = attn_outputs[1:]
         hidden_states = attn_output + residual
 
-        if encoder_hidden_states is not None:
-            if not hasattr(self, "crossattention"):
-                raise ValueError(
-                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with "
-                    "cross-attention layers by setting `config.add_cross_attention=True`"
-                )
-            residual = hidden_states
-            hidden_states = self.ln_cross_attn(hidden_states)
-            cross_attn_outputs = self.crossattention(
-                hidden_states,
-                attention_mask=attention_mask,
-                head_mask=head_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                output_attentions=output_attentions,
-            )
-            attn_output = cross_attn_outputs[0]
-            hidden_states = residual + attn_output
-            outputs = outputs + cross_attn_outputs[2:]
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
@@ -397,7 +372,7 @@ class GPT2Model(GPT2PreTrainedModel):
         self.device_map = None
         self.gradient_checkpointing = False
         self.post_init()
-        
+
         self.model_parallel = False
         self.device_map = None
         self.first_device = "cuda"
@@ -419,6 +394,24 @@ class GPT2Model(GPT2PreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.h[layer].attn.prune_heads(heads)
 
+    def _to_tensor_pool_seq(self, x, device, dtype):
+        # x: list[Tensor] / Tensor / ndarray
+        if isinstance(x, list):
+            x = torch.stack([torch.as_tensor(v) if not isinstance(v, torch.Tensor) else v for v in x], dim=0)
+        elif not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x)
+        x = x.to(device=device, dtype=dtype)  # (T, D) or (D,)
+        if x.dim() == 1:
+            return x  # (D,)
+        return x.mean(dim=0)  # (D,)
+
+    def _ensure_linear(self, layer_attr: str, in_dim: int, out_dim: int, device, dtype):
+        layer = getattr(self, layer_attr, None)
+        if layer is None or (hasattr(layer, "in_features") and layer.in_features != in_dim):
+            new = torch.nn.Linear(in_dim, out_dim).to(device=device, dtype=dtype)
+            setattr(self, layer_attr, new)
+        return getattr(self, layer_attr)
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -428,14 +421,12 @@ class GPT2Model(GPT2PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        imgs=None, auds=None, caption_ids: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
+        imgs=None, auds=None,
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -459,10 +450,6 @@ class GPT2Model(GPT2PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        if caption_ids is not None:
-            caption_ids = caption_ids.view(-1, input_shape[-1])
-            caption_embeds = self.wte(caption_ids)
-            encoder_hidden_states = caption_embeds
 
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
@@ -483,14 +470,6 @@ class GPT2Model(GPT2PreTrainedModel):
             attention_mask = attention_mask.to(dtype=self.dtype)
             attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
 
-        if self.config.add_cross_attention and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-            encoder_attention_mask = self.invert_attention_mask(encoder_attention_mask)
-        else:
-            encoder_attention_mask = None
 
         head_mask = self.get_head_mask(head_mask, self.config.n_layer)
 
@@ -500,20 +479,35 @@ class GPT2Model(GPT2PreTrainedModel):
         #         inputs_embeds[i, 0] = inputs_embeds[i, 0] + imgs[i][0]
         #         inputs_embeds[i, 1] = inputs_embeds[i, 1] + auds[i].unsqueeze(0)
 
-        for i in range(len(imgs)):
-            img_vec = imgs[i]
-            aud_vec = auds[i]
-            if img_vec.dim() > 1:  # e.g. (T, 512) => mean pool
-                img_vec = img_vec.mean(dim=0)
-            if aud_vec.dim() > 1:
-                aud_vec = aud_vec.mean(dim=0)
+        B = inputs_embeds.size(0)
+        H = inputs_embeds.size(-1)
+        dev = inputs_embeds.device
+        dt = inputs_embeds.dtype
 
-            img_proj = self.img_proj(img_vec.unsqueeze(0)).squeeze(0)
-            aud_proj = self.aud_proj(aud_vec.unsqueeze(0)).squeeze(0)
+        img_proj_batch = None
+        aud_proj_batch = None
 
-            # 将多模态特征注入到前两个 token embedding
-            inputs_embeds[i, 0] = inputs_embeds[i, 0] + img_proj
-            inputs_embeds[i, 1] = inputs_embeds[i, 1] + aud_proj
+        if imgs is not None:
+            pooled = torch.stack([self._to_tensor_pool_seq(v, dev, dt) for v in imgs], dim=0)  # (B, D_img)
+            D_img = pooled.size(-1)
+            img_proj = self._ensure_linear("img_proj", D_img, H, dev, dt)  # 自适应 in_dim
+            img_proj_batch = img_proj(pooled)  # (B, H)
+
+        if auds is not None:
+            pooled = torch.stack([self._to_tensor_pool_seq(v, dev, dt) for v in auds], dim=0)  # (B, D_aud)
+            D_aud = pooled.size(-1)
+            aud_proj = self._ensure_linear("aud_proj", D_aud, H, dev, dt)
+            aud_proj_batch = aud_proj(pooled)  # (B, H)
+
+        # 轻量化注入到前两个 token
+        if img_proj_batch is not None:
+            img = F.layer_norm(img_proj_batch, img_proj_batch.shape[-1:])
+            alpha_img = 0.3
+            inputs_embeds[:, 0, :] = inputs_embeds[:, 0, :] + alpha_img * img
+        if aud_proj_batch is not None:
+            aud = F.layer_norm(aud_proj_batch, aud_proj_batch.shape[-1:])
+            alpha_aud = 0.3
+            inputs_embeds[:, 1, :] = inputs_embeds[:, 1, :] + alpha_aud * aud
 
         position_embeds = self.wpe(position_ids)
         hidden_states = inputs_embeds + position_embeds
@@ -533,11 +527,9 @@ class GPT2Model(GPT2PreTrainedModel):
 
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
-        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+        all_cross_attentions = None
         all_hidden_states = () if output_hidden_states else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-            if caption_ids:
-                encoder_hidden_states = caption_embeds
             if self.model_parallel:
                 torch.cuda.set_device(hidden_states.device)
                 # Ensure layer_past is on same device as hidden_states (might not be correct)
@@ -565,8 +557,6 @@ class GPT2Model(GPT2PreTrainedModel):
                     None,
                     attention_mask,
                     head_mask[i],
-                    encoder_hidden_states,
-                    encoder_attention_mask,
                 )
             else:
                 outputs = block(
@@ -574,8 +564,6 @@ class GPT2Model(GPT2PreTrainedModel):
                     layer_past=layer_past,
                     attention_mask=attention_mask,
                     head_mask=head_mask[i] if head_mask is not None else None,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
@@ -586,8 +574,6 @@ class GPT2Model(GPT2PreTrainedModel):
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
-                if self.config.add_cross_attention:
-                    all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
 
             if self.model_parallel:
                 for k, v in self.device_map.items():
@@ -602,16 +588,15 @@ class GPT2Model(GPT2PreTrainedModel):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
+                for v in [hidden_states, presents, all_hidden_states, all_self_attentions]
                 if v is not None
             )
 
-        return BaseModelOutputWithPastAndCrossAttentions(
+        return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=presents,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
-            cross_attentions=all_cross_attentions,
         )
 
 
@@ -623,7 +608,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        self.num_emotions = 7 
+        self.num_emotions = 9
         self.emotion_head = nn.Linear(config.n_embd, self.num_emotions, bias=False)
 
         self.model_parallel = False
@@ -679,17 +664,15 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         emotion_labels: Optional[torch.LongTensor] = None, # <-- NEW: Add emotion_labels parameter
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        imgs=None, auds=None, caption_ids: Optional[torch.LongTensor] = None,
+        imgs=None, auds=None,
     ) -> Union[Tuple, CausalLMOutputWithEmotionClassification]: # <-- MODIFIED: Return new output class
-        
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.transformer(
@@ -700,13 +683,12 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            imgs=imgs, auds=auds, caption_ids=caption_ids,
+            imgs=imgs,
+            auds=auds,
         )
         hidden_states = transformer_outputs[0]
 
@@ -715,7 +697,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
         lm_logits = self.lm_head(hidden_states)
-        
+
         last_token_hidden_state = hidden_states[:, -1, :]
         emotion_logits = self.emotion_head(last_token_hidden_state)
 
@@ -725,10 +707,10 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             shift_labels = labels[..., 1:].contiguous()
             loss_fct_lm = CrossEntropyLoss()
             loss_lm = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            
+
             loss_fct_emotion = CrossEntropyLoss()
             loss_emotion = loss_fct_emotion(emotion_logits.view(-1, self.num_emotions), emotion_labels.view(-1))
-            
+
             loss = loss_lm + loss_emotion
         elif labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
@@ -752,7 +734,6 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
         )
 
     @staticmethod
