@@ -377,8 +377,13 @@ class GPT2Model(GPT2PreTrainedModel):
         self.embed_dim = config.hidden_size
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-        # Fusion attention for lightweight cross-modal injection
-        self.mha = nn.MultiheadAttention(
+        # Fusion attentions: separate self-attn and cross-attn
+        self.mha_self = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=getattr(self.config, "n_head", self.config.num_attention_heads),
+            batch_first=True,
+        )
+        self.mha_cross = nn.MultiheadAttention(
             embed_dim=self.embed_dim,
             num_heads=getattr(self.config, "n_head", self.config.num_attention_heads),
             batch_first=True,
@@ -464,7 +469,7 @@ class GPT2Model(GPT2PreTrainedModel):
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
         # Keep a copy of the original 0/1 attention mask for padding indicators
-        attn_mask_raw = attention_mask
+        attn_mask_raw = attention_mask.clone() if attention_mask is not None else None
         if attention_mask is not None:
             attention_mask = attention_mask.view(batch_size, -1)
             attention_mask = attention_mask[:, None, None, :]
@@ -485,10 +490,19 @@ class GPT2Model(GPT2PreTrainedModel):
         B, L, H = inputs_embeds.shape
 
         # 模态融合：仅当提供 imgs/auds 时执行
-        if imgs is not None and auds is not None:
+        # 仅在没有使用 past_key_values（即首次整体前向/解码第 1 步）时进行模态融合
+        if past_key_values is None and imgs is not None and auds is not None and isinstance(main_idx, torch.Tensor):
             txt = inputs_embeds
             # 原始 padding mask：形状 (B, L)，True 表示 pad
-            txt_pad_mask = (attn_mask_raw.view(B, -1) == 0) if attn_mask_raw is not None else None
+            if attn_mask_raw is not None:
+                # attn_mask_raw 形状 (B, L_pad) 或 (B,1,1,L_pad)，先展平再取 pad 标记
+                if attn_mask_raw.dim() > 2:
+                    flat_mask = attn_mask_raw.view(B, -1)
+                else:
+                    flat_mask = attn_mask_raw
+                txt_pad_mask = (flat_mask == 0)
+            else:
+                txt_pad_mask = None
             # 对单向量模态构造全 False 的 key_padding_mask
             aud_kmask = torch.zeros(auds.size(0), auds.size(1), dtype=torch.bool, device=device)
             img_kmask = torch.zeros(imgs.size(0), imgs.size(1), dtype=torch.bool, device=device)
@@ -503,9 +517,12 @@ class GPT2Model(GPT2PreTrainedModel):
                 aud_sel = auds[text_sel]
                 img_sel = imgs[text_sel]
 
-                main_self, _ = self.mha(txt_sel, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
-                cross_a, _ = self.mha(txt_sel, aud_sel, aud_sel, key_padding_mask=aud_kmask[text_sel])
-                cross_v, _ = self.mha(txt_sel, img_sel, img_sel, key_padding_mask=img_kmask[text_sel])
+                if txt_mask_sel is not None and txt_mask_sel.size(1) != txt_sel.size(1):
+                    txt_mask_sel = txt_mask_sel[:, :txt_sel.size(1)]
+
+                main_self, _ = self.mha_self(txt_sel, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
+                cross_a, _ = self.mha_cross(txt_sel, aud_sel, aud_sel, key_padding_mask=aud_kmask[text_sel])
+                cross_v, _ = self.mha_cross(txt_sel, img_sel, img_sel, key_padding_mask=img_kmask[text_sel])
 
                 fused_tokens[text_sel, 0, :] = (main_self + cross_a + cross_v).mean(dim=1)
 
@@ -516,9 +533,12 @@ class GPT2Model(GPT2PreTrainedModel):
                 aud_main = auds[aud_sel]
                 img_sel = imgs[aud_sel]
 
-                main_self, _ = self.mha(aud_main, aud_main, aud_main, key_padding_mask=aud_kmask[aud_sel])
-                cross_txt, _ = self.mha(aud_main, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
-                cross_img, _ = self.mha(aud_main, img_sel, img_sel, key_padding_mask=img_kmask[aud_sel])
+                if txt_mask_sel is not None and txt_mask_sel.size(1) != txt_sel.size(1):
+                    txt_mask_sel = txt_mask_sel[:, :txt_sel.size(1)]
+
+                main_self, _ = self.mha_self(aud_main, aud_main, aud_main, key_padding_mask=aud_kmask[aud_sel])
+                cross_txt, _ = self.mha_cross(aud_main, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
+                cross_img, _ = self.mha_cross(aud_main, img_sel, img_sel, key_padding_mask=img_kmask[aud_sel])
 
                 fused_tokens[aud_sel, 0, :] = (main_self + cross_txt + cross_img).mean(dim=1)
 
@@ -529,34 +549,57 @@ class GPT2Model(GPT2PreTrainedModel):
                 aud_sel_v = auds[vid_sel]
                 img_main = imgs[vid_sel]
 
-                main_self, _ = self.mha(img_main, img_main, img_main, key_padding_mask=img_kmask[vid_sel])
-                cross_txt, _ = self.mha(img_main, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
-                cross_aud, _ = self.mha(img_main, aud_sel_v, aud_sel_v, key_padding_mask=aud_kmask[vid_sel])
+                if txt_mask_sel is not None and txt_mask_sel.size(1) != txt_sel.size(1):
+                    txt_mask_sel = txt_mask_sel[:, :txt_sel.size(1)]
+
+                main_self, _ = self.mha_self(img_main, img_main, img_main, key_padding_mask=img_kmask[vid_sel])
+                cross_txt, _ = self.mha_cross(img_main, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
+                cross_aud, _ = self.mha_cross(img_main, aud_sel_v, aud_sel_v, key_padding_mask=aud_kmask[vid_sel])
 
                 fused_tokens[vid_sel, 0, :] = (main_self + cross_txt + cross_aud).mean(dim=1)
 
             # 将伪 token 拼到序列最前面
             inputs_embeds = torch.cat([fused_tokens, inputs_embeds], dim=1)
-            input_shape = inputs_embeds.size()[:-1]
 
-            # 同步 pad mask、token_type_ids、position_ids
+            # 同步 pad mask、token_type_ids，先补长度，再统一截断到 max_position_embeddings
             if attn_mask_raw is not None:
                 attn_mask_raw = torch.cat(
                     [torch.ones(B, 1, device=device, dtype=attn_mask_raw.dtype), attn_mask_raw.view(B, -1)], dim=1
                 )
             else:
-                attn_mask_raw = torch.ones(B, input_shape[-1], device=device)
+                attn_mask_raw = torch.ones(B, inputs_embeds.size(1), device=device)
 
             if token_type_ids is not None:
                 token_type_ids = torch.cat(
                     [torch.zeros(B, 1, device=device, dtype=token_type_ids.dtype), token_type_ids.view(B, -1)], dim=1
                 )
 
+            max_pos = self.config.max_position_embeddings
+            if inputs_embeds.size(1) > max_pos:
+                inputs_embeds = inputs_embeds[:, -max_pos:, :]
+                attn_mask_raw = attn_mask_raw[:, -max_pos:]
+                if token_type_ids is not None:
+                    token_type_ids = token_type_ids[:, -max_pos:]
+
+            input_shape = inputs_embeds.size()[:-1]
+
+            # 对齐 mask 长度到当前序列长度
+            if attn_mask_raw is not None and attn_mask_raw.size(1) != input_shape[-1]:
+                diff = input_shape[-1] - attn_mask_raw.size(1)
+                if diff > 0:
+                    pad = torch.ones(B, diff, device=device, dtype=attn_mask_raw.dtype)
+                    attn_mask_raw = torch.cat([pad, attn_mask_raw], dim=1)
+                elif diff < 0:
+                    attn_mask_raw = attn_mask_raw[:, -input_shape[-1]:]
+            elif attn_mask_raw is None:
+                attn_mask_raw = torch.ones(B, input_shape[-1], device=device)
+
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
         # 由新的 attn_mask_raw 重建 float attention_mask
         if attn_mask_raw is not None:
+            # attn_mask_raw 现为 (B, L)
             attention_mask = attn_mask_raw.view(batch_size, -1)
             attention_mask = attention_mask[:, None, None, :]
             attention_mask = attention_mask.to(dtype=self.dtype)
@@ -681,6 +724,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         token_type_ids = kwargs.get("token_type_ids", None)
+        main_idx = kwargs.get("main_idx", None)
+        imgs = kwargs.get("imgs", None)
+        auds = kwargs.get("auds", None)
         if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
             if token_type_ids is not None:
@@ -709,6 +755,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
                 "token_type_ids": token_type_ids,
+                "main_idx": main_idx,
+                "imgs": imgs,
+                "auds": auds,
             }
         )
         return model_inputs
@@ -734,6 +783,12 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
     ) -> Union[Tuple, CausalLMOutputWithEmotionClassification]:  # <-- MODIFIED: Return new output class
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # 对齐标签长度：若后续会插入伪 token，labels 也前补一位 -100，避免 logits/labels 长度不一致
+        if labels is not None and main_idx is not None and imgs is not None and auds is not None:
+            if labels.dim() == 2:
+                pad = torch.full((labels.size(0), 1), -100, device=labels.device, dtype=labels.dtype)
+                labels = torch.cat([pad, labels], dim=1)
 
         transformer_outputs = self.transformer(
             input_ids,
@@ -764,6 +819,14 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
         loss = None
         if labels is not None:
+            # 对齐 labels 与 logits 长度（伪 token / 截断可能导致长度差异）
+            if labels.size(1) != lm_logits.size(1):
+                tgt_len = lm_logits.size(1)
+                if labels.size(1) < tgt_len:
+                    pad = torch.full((labels.size(0), tgt_len - labels.size(1)), -100, device=labels.device, dtype=labels.dtype)
+                    labels = torch.cat([labels, pad], dim=1)
+                else:
+                    labels = labels[:, -tgt_len:]
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = CrossEntropyLoss()

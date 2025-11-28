@@ -1,13 +1,12 @@
+import warnings
 from typing import List, Dict, Tuple, Any
+import os
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import re
 import math
 
-from evaluator_model import *
+from selector.evaluator_model import *
 
 try:
     from transformers import (
@@ -41,7 +40,7 @@ class EGCEvaluator:
     - If `model_name` contains 'gpt2' -> use GPT2LMHeadModel (decoder-only).
     """
 
-    def __init__(self, model_name: str = 'facebook/bart-base', device: str = 'cuda'):
+    def __init__(self, model_name: str = 'facebook/bart-base', device: str = 'cuda', ckpt_path: str = None):
         self.device = device
         name_lower = str(model_name).lower()
 
@@ -65,43 +64,38 @@ class EGCEvaluator:
                     self.model.resize_token_embeddings(len(self.tok))
                 except Exception:
                     pass
+
+            if ckpt_path and os.path.isfile(ckpt_path):
+                try:
+                    ckpt = torch.load(ckpt_path, map_location="cpu")
+                    state = ckpt.get("model_state") or ckpt
+                    state = state.copy()
+                    cur_sd = self.model.state_dict()
+                    for key in ["transformer.wte.weight", "lm_head.weight"]:
+                        if key in state and key in cur_sd:
+                            old_w = state[key]
+                            new_w = cur_sd[key]
+                            if old_w.size(0) != new_w.size(0):
+                                adj = new_w.clone()
+                                n = min(old_w.size(0), new_w.size(0))
+                                adj[:n] = old_w[:n]
+                                state[key] = adj
+                    missing, unexpected = self.model.load_state_dict(state, strict=False)
+                    print(f"[EGCEvaluator] loaded ckpt {ckpt_path}; missing={len(missing)}, unexpected={len(unexpected)}")
+                except Exception as e:
+                    print(f"[EGCEvaluator] WARN: failed to load ckpt {ckpt_path}: {e}")
+
             self.model.eval()
-            hidden = int(self.model.config.hidden_size)
-
-            def _pick_num_heads(dim: int) -> int:
-                for h in (8, 4, 2, 1):
-                    if dim % h == 0:
-                        return h
-                return 1
-
-            self.cross_attn_heads = _pick_num_heads(hidden)
-            mha = nn.MultiheadAttention(embed_dim=hidden, num_heads=self.cross_attn_heads,
-                                        bias=False, batch_first=True)
-            with torch.no_grad():
-                eye = torch.eye(hidden)
-                mha.in_proj_weight.copy_(torch.cat([eye, eye, eye], dim=0))
-                if mha.in_proj_bias is not None:
-                    mha.in_proj_bias.zero_()
-                mha.out_proj.weight.copy_(eye)
-                if mha.out_proj.bias is not None:
-                    mha.out_proj.bias.zero_()
-            mha.requires_grad_(False)
-            self.cross_attn_mha = mha.to(device)
-
-            proj = nn.Linear(hidden * 4, hidden, bias=False)
-            with torch.no_grad():
-                eye = torch.eye(hidden).repeat(1, 4) / 4.0
-                proj.weight.copy_(eye)
-            proj.requires_grad_(False)
-            self.cross_attn_proj = proj.to(device)
 
             # BERTScore 与原实现一致
             from bert_score import BERTScorer
             self.bertscorer = BERTScorer(
                 model_type='/root/autodl-tmp/ERGM-main/tools/models/roberta-large',
-                rescale_with_baseline=False,
+                rescale_with_baseline=True,
                 device=device,
                 num_layers=24,
+                lang='en',
+                baseline_path='/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large.tsv'
             )
 
         else:
@@ -117,9 +111,9 @@ class EGCEvaluator:
             self.bertscorer = BERTScorer(
                 model_type='/root/autodl-tmp/ERGM-main/tools/models/roberta-large',
                 rescale_with_baseline=True,
+                lang='en',
                 device=device,
                 num_layers=None,
-                lang='en',
                 idf=True
             )
 
@@ -133,17 +127,25 @@ class EGCEvaluator:
             enc = self.tok(prompts, padding=True, truncation=True, return_tensors='pt').to(self.device)
             gen_kwargs = dict(
                 max_new_tokens=max_new_tokens,
+                min_new_tokens=4,
                 do_sample=False,
                 num_beams=1,
                 pad_token_id=self.tok.pad_token_id,
                 eos_token_id=self.tok.eos_token_id,
             )
             out_ids = self.model.generate(**enc, **gen_kwargs)
-            return self.tok.batch_decode(out_ids, skip_special_tokens=True)
+            outs = self.tok.batch_decode(out_ids, skip_special_tokens=True)
         else:
             enc = self.tok(prompts, padding=True, truncation=True, return_tensors='pt').to(self.device)
             out_ids = self.model.generate(**enc, max_new_tokens=max_new_tokens)
-            return self.tok.batch_decode(out_ids, skip_special_tokens=True)
+            outs = self.tok.batch_decode(out_ids, skip_special_tokens=True)
+
+        # 兜底：空串时返回原 prompt
+        cleaned = []
+        for p, o in zip(prompts, outs):
+            o = o.strip()
+            cleaned.append(o if o else p)
+        return cleaned
 
     @staticmethod
     def _alpha_ratio(s: str) -> float:
@@ -152,8 +154,12 @@ class EGCEvaluator:
         return len(letters) / max(1, len(s))
 
     def reward_bertscore(self, hyps: List[str], refs: List[str]) -> np.ndarray:
-        # 真正打分（确保顺序：候选在前，参考在后）
-        P, R, F = self.bertscorer.score(hyps, refs, verbose=False)
+        # 真正打分（确保顺序：候选在前，参考在后）；空生成用占位符替换，避免警告
+        safe_hyps = [h if (h is not None and h.strip()) else "..." for h in hyps]
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, message=".*Empty candidate.*")
+            warnings.filterwarnings("ignore", category=UserWarning, module="bert_score.*")
+            P, R, F = self.bertscorer.score(safe_hyps, refs, verbose=False)
         f = F.cpu().numpy()
 
         for i, h in enumerate(hyps):
@@ -200,7 +206,7 @@ class EGCEvaluator:
                 eos_token_id=self.tok.eos_token_id,
             )
             out_ids = self.model.generate(**enc, **gen_kwargs)
-            return self.tok.batch_decode(out_ids, skip_special_tokens=True)
+            outs = self.tok.batch_decode(out_ids, skip_special_tokens=True)
         else:
             enc = self.tok(prompts, padding=True, truncation=True, return_tensors='pt').to(self.device)
             gen_kwargs = dict(
@@ -214,7 +220,13 @@ class EGCEvaluator:
                 early_stopping=True,
             )
             out_ids = self.model.generate(**enc, **gen_kwargs)
-            return self.tok.batch_decode(out_ids, skip_special_tokens=True)
+            outs = self.tok.batch_decode(out_ids, skip_special_tokens=True)
+
+        cleaned = []
+        for p, o in zip(prompts, outs):
+            o = o.strip()
+            cleaned.append(o if o else p)
+        return cleaned
 
     @torch.no_grad()
     def generate_with_modalities(
@@ -464,50 +476,16 @@ class EGCEvaluator:
         enc = tok(prompts, padding=True, truncation=True, max_length=1024 - 128, return_tensors='pt')
         input_ids = enc['input_ids'].to(device)
         attn_mask = enc['attention_mask'].to(device, dtype=torch.long)
-        # seq_lens = attn_mask.sum(dim=1).clamp_min(1)
-        # max_valid = int(seq_lens.max().item())
-        # if max_valid < attn_mask.size(1):
-        #     # GPT-2 tokenizer默认左填充，必须保留右侧真实 token，不能简单截断前半部分
-        #     input_ids = input_ids[:, :, max_valid]
-        #     attn_mask = attn_mask[:, :, max_valid]
 
-        # position ids computed from mask so paddings stay at position 0
-        position_ids = attn_mask.cumsum(-1) - 1
-        position_ids = position_ids.clamp_min_(0)
-
-        # 2) Embed tokens -> (B, L, H)
+        # 2)  Get Embed tokens Shape -> (B, L, H)
         emb_w = self.model.transformer.wte.weight
         dtype = emb_w.dtype
         tok_emb = self.model.transformer.wte(input_ids)
-        pos_emb = self.model.transformer.wpe(position_ids)
         inputs_embeds = tok_emb.to(device=device, dtype=dtype)
 
         B, L, H = inputs_embeds.shape
 
-        ##################### debug #############################
-        gen_kwargs = dict(
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=4,
-            do_sample=do_sample,
-            num_beams=num_beams,
-            top_p=top_p,
-            temperature=temperature,
-            pad_token_id=self.model.config.pad_token_id,
-            eos_token_id=self.model.config.eos_token_id,
-            use_cache=False,
-            no_repeat_ngram_size=3,
-            repetition_penalty=1.15,
-        )
-        out_ids = self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            **gen_kwargs,
-        )
-        res = tok.batch_decode(out_ids, skip_special_tokens=True)
-        ##########################################################
-
         # 3) Project modality vectors to hidden size H (linear projection + layer_norm), numeric safe
-
         def _proj_to_hidden(x: torch.Tensor, name: str) -> torch.Tensor:
             if x.dim() == 1:
                 x = x.unsqueeze(0)
@@ -545,69 +523,8 @@ class EGCEvaluator:
         # 4) Selector weights和主模态
         w = torch.as_tensor(weights, device=device, dtype=dtype)  # (B,3)
         main_idx = torch.argmax(w, dim=1)  # 0=T,1=A,2=V
-        txt_pad_mask = (attn_mask == 0)
-        ones_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
-
-        mha = self.cross_attn_mha.to(device=device, dtype=dtype)
-        fusion_proj: nn.Linear = self.cross_attn_proj.to(device=device, dtype=dtype)
-
-        fused_concat = torch.zeros(B, L, H * 4, dtype=dtype, device=device)
-        text_feat = inputs_embeds
         aud_seq = A.unsqueeze(1)
         vid_seq = V.unsqueeze(1)
-
-        def _expand_to_text(seq: torch.Tensor, target_len: int) -> torch.Tensor:
-            if seq.size(1) == target_len:
-                return seq
-            return seq.expand(-1, target_len, -1).clone()
-
-        # --- Case 1: Text is main modality ---
-        text_sel = (main_idx == 0)
-        if torch.any(text_sel):
-            txt = text_feat[text_sel]
-            txt_mask_sel = txt_pad_mask[text_sel]
-            aud = aud_seq[text_sel]
-            vid = vid_seq[text_sel]
-            main_self, _ = mha(txt, txt, txt, key_padding_mask=txt_mask_sel)
-            cross_a, _ = mha(txt, aud, aud, key_padding_mask=torch.zeros_like(ones_mask[text_sel]))
-            cross_v, _ = mha(txt, vid, vid, key_padding_mask=torch.zeros_like(ones_mask[text_sel]))
-            fused_concat[text_sel] = torch.cat([txt, main_self, cross_a, cross_v], dim=-1)
-
-        # --- Case 2: Audio is main modality ---
-        aud_sel = (main_idx == 1)
-        if torch.any(aud_sel):
-            txt = text_feat[aud_sel]
-            txt_mask_sel = txt_pad_mask[aud_sel]
-            aud = aud_seq[aud_sel]
-            vid = vid_seq[aud_sel]
-            main_self, _ = mha(aud, aud, aud, key_padding_mask=torch.zeros_like(ones_mask[aud_sel]))
-            cross_txt, _ = mha(aud, txt, txt, key_padding_mask=txt_mask_sel)
-            cross_vid, _ = mha(aud, vid, vid, key_padding_mask=torch.zeros_like(ones_mask[aud_sel]))
-            main_self_exp = _expand_to_text(main_self, txt.size(1))
-            cross_txt_exp = _expand_to_text(cross_txt, txt.size(1))
-            cross_vid_exp = _expand_to_text(cross_vid, txt.size(1))
-            fused_concat[aud_sel] = torch.cat([txt, main_self_exp, cross_txt_exp, cross_vid_exp], dim=-1)
-
-        # --- Case 3: Video is main modality ---
-        vid_sel = (main_idx == 2)
-        if torch.any(vid_sel):
-            txt = text_feat[vid_sel]
-            txt_mask_sel = txt_pad_mask[vid_sel]
-            aud = aud_seq[vid_sel]
-            vid = vid_seq[vid_sel]
-            main_self, _ = mha(vid, vid, vid, key_padding_mask=torch.zeros_like(ones_mask[vid_sel]))
-            cross_txt, _ = mha(vid, txt, txt, key_padding_mask=txt_mask_sel)
-            cross_aud, _ = mha(vid, aud, aud, key_padding_mask=torch.zeros_like(ones_mask[vid_sel]))
-            main_self_exp = _expand_to_text(main_self, txt.size(1))
-            cross_txt_exp = _expand_to_text(cross_txt, txt.size(1))
-            cross_aud_exp = _expand_to_text(cross_aud, txt.size(1))
-            fused_concat[vid_sel] = torch.cat([txt, main_self_exp, cross_txt_exp, cross_aud_exp], dim=-1)
-
-        fused_concat = torch.nan_to_num(fused_concat, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-5, 5)
-        fused_proj = fusion_proj(fused_concat)
-        inputs_embeds = ((1 - alpha) * inputs_embeds + alpha * fused_proj).clamp_(-10, 10)
-        if not torch.isfinite(inputs_embeds).all():
-            inputs_embeds = torch.nan_to_num(inputs_embeds, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 7) Prepare gen kwargs and run a one-step sanity forward
         self.model.config.pad_token_id = getattr(self.model.config, 'pad_token_id', tok.pad_token_id)
@@ -617,8 +534,8 @@ class EGCEvaluator:
             min_new_tokens=4,
             do_sample=do_sample,
             num_beams=num_beams,
-            top_p=top_p,
-            temperature=temperature,
+            # top_p=top_p,
+            # temperature=temperature,
             pad_token_id=self.model.config.pad_token_id,
             eos_token_id=self.model.config.eos_token_id,
             use_cache=False,
@@ -629,7 +546,9 @@ class EGCEvaluator:
             _ = self.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attn_mask,
-                position_ids=position_ids,
+                main_idx=main_idx,
+                auds=aud_seq,
+                imgs=vid_seq,
                 use_cache=False,
                 return_dict=True,
             )
@@ -640,7 +559,9 @@ class EGCEvaluator:
         out_ids = self.model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attn_mask,
-            position_ids=position_ids,
+            main_idx=main_idx,
+            auds=aud_seq,
+            imgs=vid_seq,
             **gen_kwargs,
         )
         return tok.batch_decode(out_ids, skip_special_tokens=True)

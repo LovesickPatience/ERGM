@@ -31,17 +31,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Subset
 from copy import deepcopy
 
 from tqdm import tqdm
 
 from data_process.feature_extraction import TextEncoder
-from selector.selector_models import SelectorConfig, build_selector
+from selector.selector_models import SelectorConfig, build_selector, TriTowerSelector
 from selector.policies import DiscretePolicy
 from selector.dpo_losses import dpo_loss
 from selector.ppo_losses import ppo_clipped_loss, entropy_from_logits
 from selector.data_preprocess import IEMOCAPDialoguePKLDataset, FeatureDataset, make_selector_collate_fn, \
     feature_dataset_collate_fn
+from selector.evaluator import *
 
 # Optional imports for evaluators (wrap in try/except)
 try:
@@ -70,86 +72,6 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-# ----------------------------
-# Evaluators (frozen)
-# ----------------------------
-class EGCEvaluator:
-    def __init__(self, model_name: str = 'facebook/bart-base', device: str = 'cuda'):
-        if BartForConditionalGeneration is None or BartTokenizerFast is None:
-            raise ImportError("transformers (Bart) not available. Install transformers to use EGC evaluator.")
-        self.tok = BartTokenizerFast.from_pretrained(model_name)
-        self.model = BartForConditionalGeneration.from_pretrained(model_name).to(device)
-        self.model.eval()
-        self.bertscorer = BERTScorer(
-            model_type='/root/autodl-tmp/ERGM-main/tools/models/roberta-large',
-            rescale_with_baseline=False,
-            device=device,
-            num_layers=24,
-        )
-        self.device = device
-
-    @torch.no_grad()
-    def generate(self, inputs: List[str], guidance: List[str] = None, max_new_tokens: int = 64) -> List[str]:
-        if guidance is None:
-            guidance = [""] * len(inputs)
-        prompts = [(g + " " + x).strip() for x, g in zip(inputs, guidance)]
-        enc = self.tok(prompts, padding=True, truncation=True, return_tensors='pt').to(self.device)
-        out = self.model.generate(**enc, max_new_tokens=max_new_tokens)
-        return self.tok.batch_decode(out, skip_special_tokens=True)
-
-    def reward_bertscore(self, hyps: List[str], refs: List[str]) -> np.ndarray:
-        if hasattr(self, 'bertscorer'):
-            _, _, F = self.bertscorer.score(hyps, refs)
-            return F.cpu().numpy().astype(np.float32)
-        return np.zeros(len(hyps), dtype=np.float32)
-
-    def generate_with_weights(self, inputs: List[str], weights: np.ndarray,
-                              guidance: List[str] = None, max_new_tokens: int = 64,
-                              num_beams: int = 4, min_new_tokens: int = 8,
-                              no_repeat_ngram_size: int = 3, do_sample: bool = False,
-                              top_p: float = 0.9, temperature: float = 1.0):
-        if guidance is None: guidance = [""] * len(inputs)
-        # 简单模板：把动作权重以 tag 注入到 prompt
-        # 例如：[T=0.7 A=0.2 V=0.1] 也可以把 ERC/EC 的文本 guidance 拼上（若可用）
-        prefixes = [f"[T={w[0]:.2f} A={w[1]:.2f} V={w[2]:.2f}] " for w in weights]
-        prompts = [(p + g + " " + x).strip() for p, g, x in zip(prefixes, guidance, inputs)]
-        enc = self.tok(prompts, padding=True, truncation=True, return_tensors='pt').to(self.device)
-        gen_kwargs = dict(
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            num_beams=num_beams,
-            do_sample=do_sample,
-            top_p=top_p,
-            temperature=temperature,
-            early_stopping=True,
-        )
-        out = self.model.generate(**enc, **gen_kwargs)
-        return self.tok.batch_decode(out, skip_special_tokens=True)
-
-
-class ClassifierEvaluator:
-    """For ERC / EC. Frozen text classifier (RoBERTa). Reward: -CE or logit margin."""
-
-    def __init__(self, model_name: str = 'roberta-base', num_labels: int = 7, device: str = 'cuda'):
-        if RobertaForSequenceClassification is None:
-            raise ImportError("transformers (RoBERTa) not available. Install transformers to use ERC/EC evaluator.")
-        self.tok = RobertaTokenizerFast.from_pretrained(model_name)
-        self.model = RobertaForSequenceClassification.from_pretrained(model_name, num_labels=num_labels).to(device)
-        self.model.eval()
-        self.device = device
-        self.num_labels = num_labels
-
-    @torch.no_grad()
-    def reward(self, texts: List[str], labels: List[int], reduction: str = 'none') -> np.ndarray:
-        enc = self.tok(texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
-        logits = self.model(**enc).logits  # (B, C)
-        y = torch.tensor(labels, device=self.device)
-        ce = nn.CrossEntropyLoss(reduction='none')(logits, y)  # lower is better
-        # convert to reward: negative CE
-        r = (-ce).detach().cpu().numpy().astype(np.float32)
-        return r
 
 
 ACTION_SETS = {
@@ -220,6 +142,13 @@ def make_save_name(selector_name: str, task: str, rl: str, evaluator: str, val_s
     now = time.strftime("%Y%m%d%H%M", time.localtime())
     return f"{selector_name}_{task}_{rl}_{evaluator}: {val_score:.4f}_{now}"
 
+# ---- Debug helper to trim dataset ----
+def _trim_dataset(ds, n: int):
+    if n is None or n <= 0:
+        return ds
+    n = min(n, len(ds))
+    idx = list(range(n))
+    return Subset(ds, idx)
 
 # ----------------------------
 # Main training
@@ -231,10 +160,13 @@ def main():
     parser.add_argument('--task', type=str, choices=['EGC', 'ERC', 'EC'], required=True)
     parser.add_argument('--rl', type=str, choices=['dpo', 'ppo'], default='dpo')
     parser.add_argument('--action_set', type=str, default='small6')
-    parser.add_argument('--selector_model', type=str, default='MLP')
+    parser.add_argument('--selector_model', type=str, default='MLP',
+                        help='Selector model architecture (used only when --score_modal single)')
     parser.add_argument('--hidden_dim', type=int, default=512)
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--score_modal', type=str, choices=['single', 'tritower'], default='single',
+                        help='Selector scoring architecture: single-tower MLP over concatenated states, or tri-tower per-modality scoring')
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--warmup_epochs', type=int, default=3,
@@ -251,6 +183,16 @@ def main():
     parser.add_argument('--iemocap_text_json', type=str, default=None,
                         help='Path to iemocap dialog JSON (text/emo/etc). Required when --dataset IEMOCAP.')
 
+    # debug mode
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable lightweight debug mode (use small % of data)')
+    parser.add_argument('--debug_train_percent', type=float, default=0.1,
+                        help='When --debug, take this % of train samples (0-1)')
+    parser.add_argument('--debug_val_percent', type=float, default=0.1,
+                        help='When --debug, take this % of val samples (0-1)')
+    parser.add_argument('--debug_max_batches', type=int, default=10,
+                        help='When --debug, cap number of batches per epoch/loop')
+
     # Keys mapping (if your PKL field names differ)
     parser.add_argument('--key_text_feat', type=str, default='text_feat')
     parser.add_argument('--key_audio_feat', type=str, default='audio_feat')
@@ -264,6 +206,7 @@ def main():
     parser.add_argument('--egc_model', type=str, default='facebook/bart-base')
     parser.add_argument('--cls_model', type=str, default='roberta-base')
     parser.add_argument('--num_labels', type=int, default=7)
+    parser.add_argument('--evaluator_ckpt', type=str, default=None, help='Path to pretrained GPT2 evaluator ckpt (.pt)')
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -298,6 +241,22 @@ def main():
                                              session_filter=None, bos=bos, eos=eos,)
         val_ds = IEMOCAPDialoguePKLDataset(json_path=json_path, pkl_path=pkl_path, split='val',
                                            session_filter=None, bos=bos, eos=eos,)
+        # ---- Debug truncation by percentage ----
+        if args.debug:
+            def _cap01(x: float) -> float:
+                return max(0.0, min(1.0, float(x)))
+
+            tp = _cap01(args.debug_train_percent)
+            vp = _cap01(args.debug_val_percent)
+
+            def _take_percent(ds, p):
+                n = len(ds)
+                k = max(1, int(round(n * p))) if n > 0 else 0
+                idx = list(range(k))
+                return Subset(ds, idx)
+
+            train_ds = _take_percent(train_ds, tp)
+            val_ds = _take_percent(val_ds, vp)
     else:
         train_ds = FeatureDataset(args.train_pkls, key_map, args.task)
         val_ds = FeatureDataset(args.val_pkls, key_map, args.task)
@@ -313,31 +272,62 @@ def main():
     # Infer dims from first batch of DataLoader
     tmp_loader = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
     tf, af, vf, hc, texts, targets, labels = next(iter(tmp_loader))
-    input_dim = tf.shape[-1] + af.shape[-1] + vf.shape[-1] + (0 if hc is None else hc.shape[-1])
+    t_dim = tf.shape[-1]
+    a_dim = af.shape[-1]
+    v_dim = vf.shape[-1]
+    hc_dim = 0 if hc is None else hc.shape[-1]
+    input_dim = t_dim + a_dim + v_dim + (0 if hc is None else hc.shape[-1])
 
     # Build selector (DISCRETE policy assumed for DPO/PPO on action set)
     actions = ACTION_SETS[args.action_set]
     actions4warmup = ACTION_SETS["mix3"]
     num_actions = len(actions)
     num_warmup_actions = len(actions4warmup)
-    cfg = SelectorConfig(input_dim=input_dim, hidden_dim=args.hidden_dim, num_layers=args.num_layers,
-                         dropout=args.dropout, mode='discrete', num_actions=num_actions)
-    selector = build_selector(args.selector_model, cfg).to(args.device)
+
+    if args.score_modal == 'single':
+        cfg = SelectorConfig(input_dim=input_dim, hidden_dim=args.hidden_dim, num_layers=args.num_layers,
+                             dropout=args.dropout, mode='discrete', num_actions=num_actions)
+        selector = build_selector(args.selector_model, cfg).to(args.device)
+        selector_mode = 'single'
+    else:
+        # tri-tower: 独立打分，再映射到动作集合
+        selector = TriTowerSelector(
+            d_text=int(t_dim), d_aud=int(a_dim), d_vid=int(v_dim),
+            hidden_t=max(128, min(512, int(args.hidden_dim))),
+            hidden_a=max(64,  min(256, int(args.hidden_dim // 2))),
+            hidden_v=max(64,  min(256, int(args.hidden_dim // 2))),
+            dropout=args.dropout, num_actions=num_actions
+        ).to(args.device)
+        selector_mode = 'tritower'
 
     # Build evaluator per task (frozen)
     if args.task == 'EGC':
-        egc = EGCEvaluator(args.egc_model, args.device)
+        egc = EGCEvaluator(args.egc_model, args.device, ckpt_path=args.evaluator_ckpt)
         evaluator_name = 'Bertscore'
     else:
         cls = ClassifierEvaluator(args.cls_model, num_labels=args.num_labels, device=args.device)
         evaluator_name = 'NegCE'
 
     # Dataloaders
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    loader_kwargs = dict(collate_fn=collate_fn, batch_size=args.batch_size, shuffle=True)
+    val_loader_kwargs = dict(collate_fn=collate_fn, batch_size=args.batch_size, shuffle=False)
+    if args.debug:
+        loader_kwargs.update(num_workers=0, persistent_workers=False)
+        val_loader_kwargs.update(num_workers=0, persistent_workers=False)
+
+    train_loader = DataLoader(train_ds, **loader_kwargs)
+    val_loader = DataLoader(val_ds, **val_loader_kwargs)
 
     optim = torch.optim.AdamW(selector.parameters(), lr=args.lr)
     policy = DiscretePolicy()
+
+    # Helper to get selector logits by mode
+    def _selector_logits(tf, af, vf, hc=None):
+        if selector_mode == 'single':
+            states = build_state_batch(tf, af, vf, hc)
+            return selector(states)['logits']
+        else:
+            return selector(tf, af, vf)['logits']
 
     # Helper to evaluate 1 batch under a specific action index → reward vector
     def batch_reward(action, tf, af, vf, hc, texts, targets, labels, action_set) -> np.ndarray:
@@ -352,8 +342,34 @@ def main():
 
         # For EGC: generate with guidance = texts (or empty) — here we just use texts as context
         if args.task == 'EGC':
-            # Simple prompt composition; replace with your actual pipeline where modalities condition the generator
-            hyps = egc.generate_with_weights(texts, np.tile(weights, (len(texts), 1)))
+            # Prefer true multimodal light-injection when using GPT-2 evaluator.
+            if getattr(egc, 'kind', None) == 'gpt2':
+                # tf/af/vf are (B, D_t/a/v); only af/vf are used for injection
+                # try:
+                hyps = egc.generate_with_cross_attn(
+                        contexts=[t if t is not None else "" for t in texts],
+                        aud_vecs=af,
+                        vid_vecs=vf,
+                        weights=weights,
+                        max_new_tokens=64,
+                        num_beams=2,
+                        do_sample=False,
+                        temperature=0.9,
+                        top_p=0.9,
+
+                    )
+                # except Exception:
+                #     # fallback to prefix-only prompt if anything goes wrong
+                #     hyps = egc.generate_with_weights(
+                #         [t if t is not None else "" for t in texts],
+                #         np.tile(weights, (len(texts), 1))
+                #     )
+            else:
+                # BART path (no light-injection) — fallback to textual prefixing
+                hyps = egc.generate_with_weights(
+                    [t if t is not None else "" for t in texts],
+                    np.tile(weights, (len(texts), 1))
+                )
             refs = [t if t is not None else "" for t in targets]
             r = egc.reward_bertscore(hyps, refs)
             return r
@@ -372,14 +388,11 @@ def main():
             pbar = tqdm(train_loader, desc=f"[Warmup {ep + 1}/{warmup_epochs}]", dynamic_ncols=True, ascii=True, disable=not sys.stdout.isatty())
 
             for bidx, (tf, af, vf, hc, texts, targets, labels) in enumerate(pbar, start=1):
+                if args.debug and bidx >= args.debug_max_batches:
+                    break
                 tf, af, vf = tf.to(args.device), af.to(args.device), vf.to(args.device)
                 if hc is not None: hc = hc.to(args.device)
-                states = build_state_batch(tf, af, vf, hc)
-                states = states.to(args.device).to(torch.float32)
-                # pol_actions, pol_logits, pol_logp = policy_select_actions(selector, states, temperature=args.temperature,
-                #                                                           greedy=True)
-                # _ = batch_reward(pol_actions, tf, af, vf, hc, texts, targets, labels, actions4warmup)
-                # 离线打分：用 batch_reward 评估每个 action
+                # states / logits by mode
                 with torch.no_grad():
                     rewards = []
                     for a in range(num_warmup_actions):
@@ -388,7 +401,7 @@ def main():
                     rewards = np.stack(rewards, axis=1)  # (B, A)
                     y = rewards.argmax(axis=1)
 
-                logits = selector(states)['logits']
+                logits = _selector_logits(tf, af, vf, hc)
                 loss = ce_loss(logits, torch.from_numpy(y).to(args.device))
 
                 optim.zero_grad()
@@ -404,7 +417,7 @@ def main():
                 if (bidx % log_interval) == 0:
                     pbar.set_postfix({"CE": f"{loss_val:.4f}"})  # 进度条右侧显示本 batch loss
 
-                # —— 每个 epoch 结束打印平均 loss —— #
+            # —— 每个 epoch 结束打印平均 loss —— #
             avg = epoch_loss_sum / max(1, n_batches)
             print(f"[Warmup][Epoch {ep + 1}] avg CE loss = {avg:.4f}")
 
@@ -418,14 +431,16 @@ def main():
 
         pbar = tqdm(train_loader, desc=f"[DPO {epoch}]")
         for bidx, (tf, af, vf, hc, texts, targets, labels) in enumerate(pbar, start=1):
+            if args.debug and bidx >= args.debug_max_batches:
+                break
             tf, af, vf = tf.to(args.device), af.to(args.device), vf.to(args.device)
             if hc is not None:
                 hc = hc.to(args.device)
-            states = build_state_batch(tf, af, vf, hc)
 
-            # (1) 当前策略先选动作并驱动一次生成（仅用于监控，不参与loss）
-            pol_actions, pol_logits, pol_logp = policy_select_actions(selector, states, temperature=args.temperature,
-                                                                      greedy=True)
+            # 先计算 logits（当前策略）
+            logits_cur = _selector_logits(tf, af, vf, hc)
+            # 仅用于监控：贪心动作
+            pol_actions = torch.softmax(logits_cur, dim=-1).argmax(dim=-1)
             _ = batch_reward(pol_actions, tf, af, vf, hc, texts, targets, labels, actions)
 
             # (2) 离线枚举动作 → 构造 (a+, a-) 偏好对
@@ -443,14 +458,18 @@ def main():
 
             a_pos = torch.from_numpy(a_pos[valid]).to(args.device)
             a_neg = torch.from_numpy(a_neg[valid]).to(args.device)
-            states_v = states[valid]
+
+            # 过滤后的 logits
+            if selector_mode == 'single':
+                states = build_state_batch(tf, af, vf, hc)
+                states_v = states[valid]
+                logits_new = selector(states_v)['logits']
+            else:
+                logits_full = selector(tf, af, vf)['logits']
+                logits_new = logits_full[valid]
 
             # (3) 严格 DPO：new vs ref
-            logits_new = selector(states_v)['logits']
-            # logits_ref = reference_selector(states_v)['logits']  # 冻结的 reference
-
             lp_pos_new, lp_neg_new = DiscretePolicy.log_probs_pair(logits_new, a_pos, a_neg)
-            # lp_pos_ref, lp_neg_ref = DiscretePolicy.log_probs_pair(logits_ref, a_pos, a_neg)
 
             loss = dpo_loss(lp_pos_new, lp_neg_new, beta=args.beta)
 
@@ -475,11 +494,12 @@ def main():
         with torch.no_grad():
             pbar = tqdm(val_loader, desc="[Validate]")
             for bidx, (tf, af, vf, hc, texts, targets, labels) in enumerate(pbar, start=1):
+                if args.debug and bidx >= args.debug_max_batches:
+                    break
                 tf, af, vf = tf.to(args.device), af.to(args.device), vf.to(args.device)
                 if hc is not None:
                     hc = hc.to(args.device)
-                states = build_state_batch(tf, af, vf, hc)
-                logits = selector(states)['logits']  # (B, A)
+                logits = _selector_logits(tf, af, vf, hc)
                 acts = torch.softmax(logits, dim=-1).argmax(dim=-1)  # (B,)
 
                 # 向量化计算该 batch 的 reward（一次性），并记录
@@ -519,7 +539,8 @@ def main():
     torch.save({
         'args': vars(args),
         'state_dict': selector.state_dict(),
-        'config': cfg.__dict__,
+        'config': cfg.__dict__ if 'cfg' in locals() else {'d_text': int(t_dim), 'd_aud': int(a_dim), 'd_vid': int(v_dim)},
+        'score_modal': selector_mode,
         'action_set': actions,
         'val_score': final_score,
     }, path)

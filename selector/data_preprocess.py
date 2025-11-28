@@ -135,7 +135,7 @@ def _concat_text_and_boundaries(
     # ---------------
     # Collate Functions
     # ---------------
-def make_selector_collate_fn(text_encoder: Any, task: str, a_dim: int = 512, v_dim: int = 512):
+def make_selector_collate_fn(text_encoder: Any, task: str, a_dim: int = 64, v_dim: int = 64):
     """
     Collate function for IEMOCAPDialoguePKLDataset.
     """
