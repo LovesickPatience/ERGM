@@ -173,6 +173,203 @@ class PadCollate():
             sp1_tid = _tok_id(sp1_tok)
             sp2_tid = _tok_id(sp2_tok)
 
+            # --- resolve placeholder tokens (from model config via args) ---
+            img_tok = getattr(self.args, 'img_token', '<img>')
+            aud_tok = getattr(self.args, 'aud_token', '<aud>')
+            img_tid = _tok_id(img_tok)
+            aud_tid = _tok_id(aud_tok)
+
+            def _stack_1d(x):
+                # x: (T,D) or (D,) -> (D,) float32; if (T,D), mean-pool on T
+                if isinstance(x, torch.Tensor):
+                    t = x
+                else:
+                    t = torch.as_tensor(x)
+                if t.ndim == 2:
+                    t = t.mean(dim=0)
+                return t.to(torch.float32)
+
+            # basic emotion map fallback
+            _EMO_MAP = getattr(self.args, 'emo_map', None)
+            if _EMO_MAP is None:
+                _EMO_MAP = {
+                    'neutral': 0, 'neu': 0, 'others': 0,
+                    'hap': 1, 'joy': 1,
+                    'sad': 2, 'sadness': 2,
+                    'ang': 3, 'anger': 3,
+                    'sur': 4,
+                    'dis': 5,
+                    'fea': 6,
+                    'fru': 7,
+                    'exc': 8,
+                }
+
+            for b in batch:
+                ctx_text = b.get('ctx_text', '')
+                label_text = b.get('label_text', '')
+                contexts.append(b.get('contexts', b.get('ctx_text', '')))
+
+                # --- tokenize context (ctx) ---
+                enc_ctx = tokenizer(
+                    ctx_text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )
+                ids_ctx = enc_ctx.input_ids[0].to(torch.long)
+
+                # build token_type_ids for ctx by scanning speaker tokens
+                cur_sp = sp1_id
+                tt_ctx = torch.empty_like(ids_ctx)
+                for k, tid in enumerate(ids_ctx.tolist()):
+                    if sp1_tid is not None and tid == sp1_tid:
+                        cur_sp = sp1_id
+                    elif sp2_tid is not None and tid == sp2_tid:
+                        cur_sp = sp2_id
+                    tt_ctx[k] = cur_sp
+
+                # --- tokenize response (resp) ---
+                enc_resp = tokenizer(
+                    label_text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )
+                ids_resp = enc_resp.input_ids[0].to(torch.long)
+
+                # --- build prefix placeholders: [<img>, <aud>] (skip if missing in vocab) ---
+                prefix_tokens = []
+                if img_tid is not None:
+                    prefix_tokens.append(img_tid)
+                if aud_tid is not None:
+                    prefix_tokens.append(aud_tid)
+                prefix_ids = torch.tensor(prefix_tokens, dtype=torch.long)
+
+                # token types for prefix: use sp1_id as neutral speaker id
+                tt_prefix = torch.full((prefix_ids.size(0),), sp1_id, dtype=torch.long)
+
+                # --- smart truncation to keep full response supervised ---
+                # Prefer to trim from the LEFT of ctx; if still overflowing, trim from LEFT of resp.
+                total_len = prefix_ids.size(0) + ids_ctx.size(0) + ids_resp.size(0)
+                if total_len > max_len:
+                    overflow = total_len - max_len
+                    if overflow <= ids_ctx.size(0):
+                        # trim ctx from left
+                        ids_ctx = ids_ctx[overflow:]
+                        tt_ctx = tt_ctx[overflow:]
+                    else:
+                        # remove ctx entirely, trim resp from left
+                        overflow2 = overflow - ids_ctx.size(0)
+                        ids_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
+                        tt_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
+                        if overflow2 < ids_resp.size(0):
+                            ids_resp = ids_resp[overflow2:]
+                        else:
+                            # extreme case: keep the last token to avoid empty resp
+                            ids_resp = ids_resp[-1:].clone()
+
+                # --- concat inputs; labels only supervise response ---
+                input_ids_full = torch.cat([prefix_ids, ids_ctx, ids_resp], dim=0)
+                tt_full = torch.cat([
+                    tt_prefix,
+                    tt_ctx,
+                    (tt_ctx[-1:] if tt_ctx.numel() > 0 else torch.tensor([sp1_id], dtype=torch.long)).repeat(ids_resp.size(0))
+                ], dim=0)
+
+                labels_full = torch.cat([
+                    torch.full((prefix_ids.size(0) + ids_ctx.size(0),), -100, dtype=torch.long),
+                    ids_resp.clone()
+                ], dim=0)
+
+                input_ids_list.append(input_ids_full)
+                token_type_ids_list.append(tt_full)
+                labels_list.append(labels_full)
+
+                # Audio/Video features → (D,) then repeat per-token to align with ERGM expectation
+                # ---- audio ----
+                af_src = b['audio_feats'] if ('audio_feats' in b and b['audio_feats'] is not None) else b.get(
+                    'audio_feat', None)
+                if af_src is None:
+                    af = torch.zeros(a_dim, dtype=torch.float32)
+                else:
+                    af = _stack_1d(af_src)
+
+                # ---- video ----
+                vf_src = b['video_feats'] if ('video_feats' in b and b['video_feats'] is not None) else b.get(
+                    'video_feat', None)
+                if vf_src is None:
+                    vf = torch.zeros(v_dim, dtype=torch.float32)
+                else:
+                    vf = _stack_1d(vf_src)
+                seq_len = input_ids_full.size(0)
+                imgs.append([vf.clone() for _ in range(seq_len)])
+                auds.append([af.clone() for _ in range(seq_len)])
+
+                emo_label_val = b.get('emotion_label', None)
+                if emo_label_val is None:
+                    emo_label_val = _EMO_MAP.get(str(b.get('erc_label_text', 'neu')).lower(), 0)
+                emotion_labels.append(int(emo_label_val))
+
+            # Pad sequences across batch
+            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=eos_id)
+            token_type_ids = torch.nn.utils.rnn.pad_sequence(token_type_ids_list, batch_first=True, padding_value=sp1_id)
+            labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+
+            return (
+                input_ids,
+                token_type_ids,
+                labels,
+                imgs,
+                auds,
+                contexts,
+                emotion_labels,
+            )
+        return collate
+
+    def iemocap_collate_without_prefix(self, tokenizer, a_dim: int = 512, v_dim: int = 512):
+        # Build ERGM-compatible 7-tuple for IEMOCAP PKL+JSON samples
+        # Expected per-sample keys (from IEMOCAPDialoguePKLDataset):
+        #  - ctx_text (string with <sp1>/<sp2> already inserted)
+        #  - label_text (string)
+        #  - audio_feats (Tensor or ndarray) shape (T,D) or (D,)
+        #  - video_feats (Tensor or ndarray) shape (T,D) or (D,)
+        #  - erc_label_text (str) or emotion_label (int)
+        #  - (optional) ctx_speaker_ids / utt_bounds if you want to refine token_type_ids
+        def collate(batch):
+            input_ids_list: list = []
+            token_type_ids_list: list = []
+            labels_list: list = []
+            imgs: list = []
+            auds: list = []
+            contexts: list = []
+            emotion_labels: list = []
+
+            # speaker tokens & ids (defaults)
+            sp1_tok = getattr(self.args, 'sp1_token', '<sp1>')
+            sp2_tok = getattr(self.args, 'sp2_token', '<sp2>')
+            sp1_id = getattr(self.args, 'sp1_id', 0)
+            sp2_id = getattr(self.args, 'sp2_id', 1)
+            eos_id = getattr(self.args, 'eos_id', self.eos_id)
+            max_len = getattr(self.args, 'max_len', 512)
+
+            # Resolve token ids of speaker tokens if present in tokenizer vocab
+            def _tok_id(tok):
+                try:
+                    tid = tokenizer.convert_tokens_to_ids(tok)
+                    # Some tokenizers return unk for custom tokens; guard it
+                    if tid is None or tid < 0:
+                        return None
+                    return tid
+                except Exception:
+                    return None
+
+            sp1_tid = _tok_id(sp1_tok)
+            sp2_tid = _tok_id(sp2_tok)
+
             def _stack_1d(x):
                 # x: (T,D) or (D,) -> (D,) float32; if (T,D), mean-pool on T
                 if isinstance(x, torch.Tensor):
@@ -236,30 +433,38 @@ class PadCollate():
                 ids_resp = enc_resp.input_ids[0].to(torch.long)
 
                 # --- smart truncation to keep full response supervised ---
-                # We prefer to trim from the LEFT of ctx so that the entire response stays
+                # Prefer to trim from the LEFT of ctx; if still overflowing, trim from LEFT of resp.
                 total_len = ids_ctx.size(0) + ids_resp.size(0)
                 if total_len > max_len:
                     overflow = total_len - max_len
-                    if overflow < ids_ctx.size(0):
+                    if overflow <= ids_ctx.size(0):
+                        # trim ctx from left
                         ids_ctx = ids_ctx[overflow:]
                         tt_ctx = tt_ctx[overflow:]
                     else:
-                        # ctx fully removed; keep the last max_len tokens of resp
-                        cut = overflow - ids_ctx.size(0)
+                        # remove ctx entirely, trim resp from left
+                        overflow2 = overflow - ids_ctx.size(0)
                         ids_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
                         tt_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
-                        ids_resp = ids_resp[-max_len:]
+                        if overflow2 < ids_resp.size(0):
+                            ids_resp = ids_resp[overflow2:]
+                        else:
+                            # extreme case: keep the last token to avoid empty resp
+                            ids_resp = ids_resp[-1:].clone()
 
                 # --- concat inputs; labels only supervise response ---
                 input_ids_full = torch.cat([ids_ctx, ids_resp], dim=0)
-                tt_full = torch.cat([tt_ctx, (
-                    tt_ctx[-1:] if tt_ctx.numel() > 0 else torch.tensor([sp1_id], dtype=torch.long)).repeat(
-                    ids_resp.size(0))], dim=0)
+                tt_full = torch.cat([
+                                tt_ctx,
+                                (tt_ctx[-1:] if tt_ctx.numel() > 0 else torch.tensor([sp1_id],
+                                                                                     dtype=torch.long)).repeat(
+                                    ids_resp.size(0))
+                            ], dim=0)
 
                 labels_full = torch.cat([
-                    torch.full((ids_ctx.size(0),), -100, dtype=torch.long),
-                    ids_resp.clone()
-                ], dim=0)
+                                torch.full((ids_ctx.size(0),), -100, dtype=torch.long),
+                                ids_resp.clone()
+                            ], dim=0)
 
                 input_ids_list.append(input_ids_full)
                 token_type_ids_list.append(tt_full)

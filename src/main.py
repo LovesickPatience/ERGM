@@ -1,29 +1,22 @@
-import os
 import sys
 import argparse
-import copy
-import math
 import random
 import numpy as np
-from itertools import chain
 
-import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.nn import functional as F
 
-from tqdm import tqdm
 from transformers import (
     GPT2Tokenizer,
     get_polynomial_decay_schedule_with_warmup,
 )
 
-from model import * 
+from src.model.model import *
 from custom_dataset import *
 from eval.evaluate import Evaluator
 from selector.selector_models import SelectorConfig, build_selector
-from selector.data_preprocess import IEMOCAPDialoguePKLDataset, make_selector_collate_fn
+from selector.data_preprocess import IEMOCAPDialoguePKLDataset
+
 
 def print_custom(context, ref, sentence):
     """Formats the context, reference, and generated sentence for printing."""
@@ -115,21 +108,27 @@ class Manager:
         self.tokenizer = GPT2Tokenizer.from_pretrained(self.args.model_type)
         special_tokens = {
             "bos_token": self.args.bos_token,
-            "additional_special_tokens": [self.args.sp1_token, self.args.sp2_token],
+            "additional_special_tokens": [self.args.sp1_token, self.args.sp2_token, "<img>", "<aud>"],
         }
         self.args.eos_token = self.tokenizer.eos_token
         num_new_tokens = self.tokenizer.add_special_tokens(special_tokens)
+        self.args.final_vocab_size = len(self.tokenizer)
+
         vocab = self.tokenizer.get_vocab()
         self.args.vocab_size = len(vocab)
         self.args.bos_id = vocab[self.args.bos_token]
         self.args.eos_id = vocab[self.args.eos_token]
         self.args.sp1_id = vocab[self.args.sp1_token]
         self.args.sp2_id = vocab[self.args.sp2_token]
+        self.args.img_id = self.tokenizer.convert_tokens_to_ids("<img>")
+        self.args.aud_id = self.tokenizer.convert_tokens_to_ids("<aud>")
 
         print("Loading the model...")
         self.fix_seed(self.args.seed)
         self.model = GPT2LMHeadModel.from_pretrained(self.args.model_type).to(self.args.device)
-        self.model.resize_token_embeddings(self.args.vocab_size)
+        self.model.config.img_id = self.args.img_id
+        self.model.config.aud_id = self.args.aud_id
+        self.model.resize_token_embeddings(self.args.final_vocab_size)
         # === Load selector (optional) ===
         self.selector = None
         self.selector_action_table = None
@@ -204,12 +203,33 @@ class Manager:
             if os.path.exists(ckpt_path):
                 print("Loading the trained checkpoint...")
                 ckpt = torch.load(ckpt_path, map_location=self.args.device)
-                self.model.load_state_dict(ckpt["model_state_dict"], strict=False) # Use strict=False to handle the new emotion_head
+                sd = ckpt['model_state_dict']
+
+                if "transformer.wte.weight" in sd:
+                    old_wte = sd["transformer.wte.weight"]
+                    new_wte = self.model.transformer.wte.weight
+                    if old_wte.size(0) != new_wte.size(0):
+                        print(f"[vocab expand] ckpt_vocab={old_wte.size(0)}, current_vocab={new_wte.size(0)}")
+                        with torch.no_grad():
+                            num = min(old_wte.size(0), new_wte.size(0))
+                            new_wte[:num] = old_wte[:num]
+                        sd.pop("transformer.wte.weight")
+
+                if "lm_head.weight" in sd:
+                    old_lm = sd["lm_head.weight"]
+                    new_lm = self.model.lm_head.weight
+                    if old_lm.size(0) != new_lm.size(0):
+                        with torch.no_grad():
+                            num = min(old_lm.size(0), new_lm.size(0))
+                            new_lm[:num] = old_lm[:num]
+                        sd.pop("lm_head.weight")
+
+                self.model.load_state_dict(sd, strict=False) # Use strict=False to handle the new emotion_head
 
                 if self.args.mode == "train":
                     print(f"Training will resume from checkpoint: {self.args.ckpt_name}.ckpt")
-                    self.optim.load_state_dict(ckpt["optim_state_dict"])
-                    self.sched.load_state_dict(ckpt["sched_state_dict"])
+                    # self.optim.load_state_dict(ckpt["optim_state_dict"])
+                    # self.sched.load_state_dict(ckpt["sched_state_dict"])
                     self.best_ppl = ckpt.get('ppl', sys.float_info.max) # Load best ppl if available
                     self.last_epoch = ckpt["epoch"]
                 else:
@@ -250,16 +270,19 @@ class Manager:
 
                 # === selector-driven guidance injection (only when enabled) ===
                 if self.args.selector_enable != "off" and (self.selector is not None):
-                    try:
-                        input_ids, token_type_ids = self._maybe_apply_selector(input_ids, token_type_ids, imgs, auds)
-                    except Exception as e:
-                        print(f"[Selector][train] skip due to: {e}")
+                    # try:
+                    input_ids, token_type_ids, mix_w = self._maybe_apply_selector(input_ids, token_type_ids, imgs, auds)
+                    # except Exception as e:
+                    #     print(f"[Selector][train] skip due to: {e}")
+                    #     mix_w = None
+                else:
+                    mix_w = None
 
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
                     labels=lm_labels, emotion_labels=emotion_labels,
                     imgs=imgs,
-                    # auds=auds,
+                    auds=auds,
                 )
 
                 loss = outputs.loss
@@ -303,7 +326,7 @@ class Manager:
                     "ppl": self.best_ppl,
                     "epoch": self.last_epoch,
                 }
-                save_path = os.path.join(self.args.ckpt_dir, f"best_ckpt_epoch={epoch}_valid_ppl={self.best_ppl:.4f}.ckpt")
+                save_path = os.path.join(self.args.ckpt_dir, f"best_ckpt_epoch={epoch}_valid_ppl={self.best_ppl:.4f}_val_emo_acc={valid_acc:.2f}%_text+imgs+auds.ckpt")
                 torch.save(state_dict, save_path)
                 print("*" * 10 + " Current best checkpoint is saved. " + "*" * 10)
                 print(save_path)
@@ -347,7 +370,7 @@ class Manager:
                     input_ids=input_ids, token_type_ids=token_type_ids,
                     labels=lm_labels, emotion_labels=emotion_labels,
                     imgs=imgs,
-                    # auds=auds
+                    auds=auds
                 )
 
                 valid_total_losses.append(outputs.loss.item())
@@ -417,22 +440,123 @@ class Manager:
             feat = emb.mean(dim=1)  # (B, E)
         return feat.float()
 
-    @staticmethod
-    def _pool_modal_feat(x):
-        """接受 (B,D) 或 (B,T,D)，返回 (B,D)，其他情况返回 None。"""
+    def _pool_modal_feat(self, x):
+        """
+        Robust pooling utility for modal features.
+
+        Accepts:
+          - Tensor: (B, D) or (B, T, D) or (T, D) or (D,)
+          - list/tuple length B where each item is (T, D) or (D,) or list of frame tensors
+
+        Returns:
+          Tensor of shape (B, D) after temporal mean pooling.
+          Assumes a consistent feature dimensionality across samples (e.g., D=64).
+        """
         if x is None:
             return None
-        if isinstance(x, (list, tuple)):
+
+        # Helper: pool a single sample to 1D vector
+        def _pool_one(item):
+            # item 可能是 tensor / list[tensor or array] / array / list[list[...]]
+            if torch.is_tensor(item):
+                t = item.float()
+                if t.dim() == 2:  # (T, D)
+                    return t.mean(dim=0)
+                if t.dim() == 1:  # (D,)
+                    return t
+                if t.dim() == 3:  # (S, T, D) => 均值
+                    return t.mean(dim=(0, 1))
+                # 其他形状，尽量压成 1D
+                return t.reshape(-1)
+
+            if isinstance(item, (list, tuple)):
+                elems = []
+                for e in item:
+                    if e is None:
+                        continue
+                    if torch.is_tensor(e):
+                        elems.append(e.float().reshape(-1))
+                    else:
+                        try:
+                            te = torch.as_tensor(e, dtype=torch.float32).reshape(-1)
+                            elems.append(te)
+                        except Exception:
+                            continue
+                if len(elems) == 0:
+                    return None
+                # 尝试直接堆叠，如果形状一致就是 (T, D)
+                try:
+                    M = torch.stack(elems, dim=0)
+                    if M.dim() == 2:
+                        return M.mean(dim=0)
+                    elif M.dim() == 3:
+                        return M.mean(dim=(0, 1))
+                    else:
+                        return M.reshape(-1)
+                except RuntimeError:
+                    # 帧向量长度不一致：pad/trunc 到最大 D 再均值
+                    D = max(e.shape[0] for e in elems)
+                    padded = []
+                    for e in elems:
+                        if e.shape[0] < D:
+                            pad = torch.zeros(D - e.shape[0], dtype=e.dtype, device=e.device)
+                            padded.append(torch.cat([e, pad], dim=0))
+                        else:
+                            padded.append(e[:D])
+                    M = torch.stack(padded, dim=0)  # (T, D)
+                    return M.mean(dim=0)
+
+            # 其他可转 tensor 的类型
             try:
-                x = torch.tensor(x)
+                t = torch.as_tensor(item, dtype=torch.float32)
+                if t.dim() == 2:
+                    return t.mean(dim=0)
+                if t.dim() == 1:
+                    return t
+                return t.reshape(-1)
             except Exception:
                 return None
-        if not torch.is_tensor(x):
+
+        # 已是 Tensor 的 batch
+        if torch.is_tensor(x):
+            x = x.float()
+            if x.dim() == 3:  # (B, T, D) -> (B, D)
+                return x.mean(dim=1)
+            if x.dim() == 2:  # (B, D)
+                return x
+            if x.dim() == 1:  # (D,) -> (1, D)
+                return x.unsqueeze(0)
+            if x.dim() >= 2:  # 尝试压平
+                B = x.size(0)
+                return x.reshape(B, -1).float()
             return None
-        x = x.float()
-        if x.dim() == 3:
-            return x.mean(dim=1)
-        return x
+
+        # list/tuple 的 batch：逐样本池化 -> 对齐维度 -> stack
+        if isinstance(x, (list, tuple)) and len(x) > 0:
+            per_sample = []
+            for item in x:
+                v = _pool_one(item)
+                if v is not None:
+                    per_sample.append(v)
+
+            if len(per_sample) == 0:
+                return None
+
+            # 统一到同一 D（你现在已统一为 64，但这里仍留有保护）
+            D = per_sample[0].shape[0]
+            aligned = []
+            for v in per_sample:
+                if v.shape[0] == D:
+                    aligned.append(v)
+                elif v.shape[0] < D:
+                    pad = torch.zeros(D - v.shape[0], dtype=v.dtype)
+                    aligned.append(torch.cat([v, pad], dim=0))
+                else:
+                    aligned.append(v[:D])
+
+            return torch.stack(aligned, dim=0)  # (B, D)
+
+        return None
 
     def _maybe_apply_selector(self, input_ids, token_type_ids, imgs, auds):
         """
@@ -501,7 +625,7 @@ class Manager:
             L = new_input[i].size(0)
             out_input[i, :L] = new_input[i]
             out_type[i, :L]  = new_type[i]
-        return out_input, out_type
+        return out_input, out_type, weights
 
     def test(self):
         print("Test processing: Collecting generated texts and references...")
@@ -604,8 +728,12 @@ if __name__ == "__main__":
         manager = Manager(args)
         
         hypotheses, references, true_labels, losses = manager.test()
-        
-        evaluator = Evaluator(device=manager.args.device)
+
+        evaluator = Evaluator(device=manager.args.device,
+                              bert_model_path='/root/autodl-tmp/ERGM-main/tools/models/roberta-large',
+                              baseline_path="/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large.tsv",
+                              num_layers=24,
+                              rescale_with_baseline=True, )
         
         final_metrics = evaluator.evaluate_all(
             hypotheses=hypotheses,

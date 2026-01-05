@@ -75,12 +75,12 @@ def _rolling_pairs(utterances: List[Dict[str, Any]]):
 
 def _concat_text_and_boundaries(
         utts: List[Dict[str, Any]],
-        bos: str = "<s>",
+        bos: Optional[str] = "<s>",
         eos: str = "</s>",
         speaker_tokens: Optional[List[str]] = None,
         insert_space_after_sp: bool = True,
     ) -> Tuple[str, List[Tuple[str, int, int]], List[Tuple[int, int]]]:
-    """Concatenate utterances with a *single* BOS at the start and a *single* EOS at the end.
+    """Concatenate utterances with a *single* BOS at the start (if provided) and a *single* EOS at the end.
     Each utterance is prefixed with its speaker token (e.g., <sp1>/<sp2>) if provided.
 
     Returns:
@@ -88,12 +88,12 @@ def _concat_text_and_boundaries(
         utt_bounds: list of (utterance_id, start_char, end_char) covering [speaker_token + space + utterance_text]
         token_offsets: naive whitespace token offsets for the *original utterance text* region in the full string
     """
-    # Start with a single BOS
-    text = bos
+    # Start with a single BOS if provided
+    text = bos if bos is not None else ""
     utt_bounds: List[Tuple[str, int, int]] = []
     token_offsets: List[Tuple[int, int]] = []
 
-    cursor = len(bos)  # current length of text
+    cursor = len(text)  # current length of text
 
     for i, u in enumerate(utts):
         utext = u.get("text", "")
@@ -128,7 +128,8 @@ def _concat_text_and_boundaries(
             idx = e
 
     # Append a single EOS at the very end
-    text += eos
+    if eos is not None:
+        text += eos
     return text, utt_bounds, token_offsets
 
 
@@ -242,7 +243,7 @@ class IEMOCAPDialoguePKLDataset(Dataset):
     SPLIT_INDEX = {"train":0, "test":2, "val":1}
 
     def __init__(self, json_path: str, pkl_path: str, split: str = "train", session_filter: Optional[str] = None,
-                 bos: str = "<s>", eos: str = "</s>", sp1_token: str = "<sp1>", sp2_token: str = "<sp2>"):
+                 bos: str = None, eos: str = "</s>", sp1_token: str = "<sp1>", sp2_token: str = "<sp2>"):
         super().__init__()
         self.meta = _load_json(json_path)
         with open(pkl_path, "rb") as f:
@@ -250,6 +251,9 @@ class IEMOCAPDialoguePKLDataset(Dataset):
         si = self.SPLIT_INDEX[split]
         self.audio_bank: Dict[str, Any] = blob["audio"][si]
         self.video_bank: Dict[str, Any] = blob["video"][si]
+        # Restrict to utterances that belong to the requested split (keys come from the pre-split A/V banks)
+        # Otherwise train/val/test will see the same text dialogues.
+        allowed_utt_ids = set(self.audio_bank.keys()) | set(self.video_bank.keys())
         self.samples: List[Dict[str, Any]] = []
         self.bos = bos
         self.eos = eos
@@ -272,6 +276,9 @@ class IEMOCAPDialoguePKLDataset(Dataset):
                 return sid, tok
 
             # ensure utterances are in chronological order (if time key exists)
+            utts = [u for u in utts if u.get("utterance_id") in allowed_utt_ids]
+            if len(utts) < 2:
+                continue
             utts = sorted(utts, key=lambda u: float(u.get("start_time", 0.0)))
             for ctx_utts, label_utt in _rolling_pairs(utts):
                 # speakers for context and label (build tokens/ids first)

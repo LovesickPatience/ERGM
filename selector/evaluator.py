@@ -522,9 +522,16 @@ class EGCEvaluator:
 
         # 4) Selector weights和主模态
         w = torch.as_tensor(weights, device=device, dtype=dtype)  # (B,3)
+        w_t = w[:, 0:1].clamp(min=0.0)  # (B,1)
+        w_a = w[:, 1:2].clamp(min=0.0)
+        w_v = w[:, 2:3].clamp(min=0.0)
+        # main 模态仍然取 argmax，但同时把模态向量按权重缩放，确保动作差异生效
         main_idx = torch.argmax(w, dim=1)  # 0=T,1=A,2=V
-        aud_seq = A.unsqueeze(1)
-        vid_seq = V.unsqueeze(1)
+        # scale modality sequences by weights so downstream cross-attn reflects action choice
+        aud_seq = (w_a.unsqueeze(-1) * A).unsqueeze(1)  # (B,1,H)
+        vid_seq = (w_v.unsqueeze(-1) * V).unsqueeze(1)  # (B,1,H)
+        # 也对文本 token 做轻微缩放，避免全依赖模态
+        inputs_embeds = inputs_embeds * (0.5 + 0.5 * w_t.unsqueeze(-1))
 
         # 7) Prepare gen kwargs and run a one-step sanity forward
         self.model.config.pad_token_id = getattr(self.model.config, 'pad_token_id', tok.pad_token_id)

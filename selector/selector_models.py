@@ -133,10 +133,92 @@ class TriTowerSelector(nn.Module):
         logits = self.head(scores3)  # (B, A)
         return {"logits": logits, "scores3": scores3}
 
+class GatedTriTowerSelector(BaseSelector):
+    """
+    三塔 + gated attention 的 selector：
+
+    - 输入: states 形状 (B, input_dim)，通常是 [text_feat; audio_feat; video_feat; ...] 拼接
+    - 先过一个共享 backbone 得到 h_shared (B, H)
+    - 三个塔分别从 h_shared 中提取模态专属向量 h_T, h_A, h_V
+    - gate_net(h_T, h_A, h_V) 得到每个模态的 gate logit，softmax 后得到权重 (B,3)
+    - 融合向量 h_fused = Σ_i gate_i * h_i
+    - 最后 logits = out(h_fused) 作为对动作集合的打分
+    """
+
+    def __init__(self, cfg: SelectorConfig):
+        super().__init__()
+        self.cfg = cfg
+        H = cfg.hidden_dim
+
+        # 1) 共享 backbone：把所有模态拼接后的 states 编成一个通用表示
+        self.backbone = MLP(
+            in_dim=cfg.input_dim,
+            hidden_dim=cfg.hidden_dim,
+            out_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            dropout=cfg.dropout,
+        )
+
+        # 2) 三个塔：在 shared 表示上再加一层投影，得到三种“模态专属”向量
+        self.text_head = nn.Linear(H, H)
+        self.audio_head = nn.Linear(H, H)
+        self.video_head = nn.Linear(H, H)
+
+        # 3) gate 网络：从三路特征拼接得到 (B,3) 的 gate logits
+        #    gated attention: gate = softmax(gate_logits)
+        self.gate_net = nn.Sequential(
+            nn.Linear(H * 3, H),
+            nn.Tanh(),
+            nn.Linear(H, 3)   # 对应 3 个模态的 gate logit
+        )
+
+        # 4) 输出头：对融合后的表示打分，得到 num_actions 维 logits
+        self.out = nn.Linear(H, cfg.num_actions)
+
+    def forward(self, states: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            states: (B, input_dim)，通常是 [tf; af; vf; hc] 这种拼接后的特征
+        Returns:
+            dict: {
+              "logits": (B, num_actions),
+              "gate":   (B, 3)  # 每个模态的 gate 权重，便于可视化/分析
+            }
+        """
+        # 1) 共享编码
+        h_shared = self.backbone(states)          # (B, H)
+
+        # 2) 三个模态塔
+        h_t = torch.tanh(self.text_head(h_shared))   # (B, H)
+        h_a = torch.tanh(self.audio_head(h_shared))  # (B, H)
+        h_v = torch.tanh(self.video_head(h_shared))  # (B, H)
+
+        # 3) gated attention：根据三个模态的特征，学习一个 softmax gate
+        #    先拼接 -> (B, 3H) -> gate_logits (B,3) -> gate_weights (B,3)
+        h_cat = torch.cat([h_t, h_a, h_v], dim=-1)   # (B, 3H)
+        gate_logits = self.gate_net(h_cat)          # (B, 3)
+        gate_weights = F.softmax(gate_logits, dim=-1)  # (B, 3)
+
+        # 4) 用 gate 权重对三路特征做加权求和，得到融合向量
+        #    先堆叠成 (B, 3, H)，再按模态维度加权
+        h_stack = torch.stack([h_t, h_a, h_v], dim=1)          # (B, 3, H)
+        gate_exp = gate_weights.unsqueeze(-1)                  # (B, 3, 1)
+        h_fused = (gate_exp * h_stack).sum(dim=1)              # (B, H)
+
+        # 5) 输出动作用 logits
+        logits = self.out(h_fused)                             # (B, num_actions)
+
+        return {
+            "logits": logits,
+            "gate": gate_weights,   # 方便你 later 可视化看 selector 偏好哪种模态
+        }
+
 
 # Registry for future models
 SELECTOR_REGISTRY = {
     "MLP": MLPSelector,
+    "TriTower": TriTowerSelector,
+    "GatedTriTower": GatedTriTowerSelector,
 }
 
 

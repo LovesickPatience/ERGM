@@ -5,7 +5,8 @@ import librosa
 from PIL import Image
 from transformers import (Wav2Vec2Processor, Wav2Vec2Model, BlipProcessor, BlipModel, BartForConditionalGeneration,
                           BartTokenizer, RobertaForSequenceClassification, RobertaTokenizer, RobertaModel,
-                          BartTokenizerFast, BartModel, RobertaTokenizerFast)
+                          BartTokenizerFast, BartModel, RobertaTokenizerFast,
+                          GPT2TokenizerFast, GPT2Model, GPT2Config, GPT2LMHeadModel)
 
 
 # Text
@@ -14,35 +15,62 @@ class TextEncoder:
                  device: str = 'cpu'):
         self.task = task
         self.device = device
+        self.out_dim = None  # will be set after loading encoder
         if task == 'EGC':
-            if BartTokenizerFast is None or BartModel is None:
-                raise ImportError("transformers (Bart) not available.")
-            self.tok = BartTokenizerFast.from_pretrained(egc_model)
-            self.enc = BartModel.from_pretrained(egc_model).to(device)
-            self.enc.eval()
+            if 'bart' in egc_model.lower():
+                if BartTokenizerFast is None or BartModel is None:
+                    raise ImportError("transformers (Bart) not available.")
+                self.tok = BartTokenizerFast.from_pretrained(egc_model)
+                self.enc = BartModel.from_pretrained(egc_model).to(device)
+                self.enc.eval()
+                self.out_dim = self.enc.config.hidden_size
+            elif 'gpt2' in egc_model.lower():
+                if GPT2TokenizerFast is None or GPT2Model is None:
+                    raise ImportError("transformers (GPT2) not available.")
+                self.tok = GPT2TokenizerFast.from_pretrained(egc_model)
+                special_tokens = {
+                    "additional_special_tokens": ["<sp1>", "<sp2>"],
+                }
+                num_new_tokens = self.tok.add_special_tokens(special_tokens)
+                # GPT‑2 没有默认 pad_token，设为 eos 以便批处理/attention_mask 正确
+                if self.tok.pad_token is None:
+                    self.tok.pad_token = self.tok.eos_token
+                self.enc = GPT2Model.from_pretrained(egc_model).to(device)
+                try:
+                    self.enc.resize_token_embeddings(len(self.tok))
+                except Exception:
+                    pass
+                self.enc.eval()
+                self.out_dim = self.enc.config.hidden_size  # 通常 768
+            else:
+                raise ValueError(f"Unsupported EGC text backbone: {egc_model}")
         else:
             if RobertaTokenizerFast is None or RobertaModel is None:
                 raise ImportError("transformers (RoBERTa) not available.")
             self.tok = RobertaTokenizerFast.from_pretrained(cls_model)
             self.enc = RobertaModel.from_pretrained(cls_model).to(device)
             self.enc.eval()
+            self.out_dim = self.enc.config.hidden_size
 
     @torch.no_grad()
     def encode(self, texts: List[str]) -> torch.Tensor:
-        # Returns (B, D)
-        enc = self.tok(texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
+        """Return (B, D) mean‑pooled encoder features with padding‑aware masking."""
+        enc = self.tok(texts, padding=True, truncation=True, return_tensors='pt')
+        # 将输入移到与模型相同的 device
+        for k in enc:
+            enc[k] = enc[k].to(self.device)
         outputs = self.enc(**enc)
-        if self.task == 'EGC':
-            # Mean-pool encoder last_hidden_state (B, L, D)
-            last = outputs.last_hidden_state
-            mask = enc['attention_mask'].unsqueeze(-1)  # (B, L, 1)
-            summed = (last * mask).sum(dim=1)
-            counts = mask.sum(dim=1).clamp(min=1)
-            mean_pooled = summed / counts
-            return mean_pooled.cpu()
-        else:
-            # Use [CLS] token (first token) for RoBERTa
-            return outputs.last_hidden_state[:, 0].cpu()
+        # 统一使用 last_hidden_state + attention_mask 做 mean pooling
+        last = outputs.last_hidden_state  # (B, L, D)
+        attn = enc.get('attention_mask', None)
+        if attn is None:
+            # 保险：若无 mask，构造全 1
+            attn = torch.ones(last.size()[:2], dtype=last.dtype, device=last.device)
+        attn = attn.unsqueeze(-1)  # (B, L, 1)
+        summed = (last * attn).sum(dim=1)
+        counts = attn.sum(dim=1).clamp(min=1.0)
+        mean_pooled = summed / counts
+        return mean_pooled.detach().cpu()
 
 # Audio
 def extract_audio_features(audio_path):

@@ -30,6 +30,7 @@ from typing import List, Dict, Tuple, Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import Subset
 from copy import deepcopy
@@ -134,6 +135,23 @@ def apply_action_weights(weights: np.ndarray, tf: torch.Tensor, af: torch.Tensor
     return fused  # (B, D)
 
 
+def _align_to_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
+    """Pad/truncate + layer_norm to a common dim (deterministic, no params)."""
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    D = x.size(-1)
+    if D == target_dim:
+        y = x
+    elif D > target_dim:
+        y = x[..., :target_dim]
+    else:
+        pad = torch.zeros(*x.shape[:-1], target_dim - D, dtype=x.dtype, device=x.device)
+        y = torch.cat([x, pad], dim=-1)
+    y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    y = F.layer_norm(y, (target_dim,))
+    return y
+
+
 # ----------------------------
 # Training utilities
 # ----------------------------
@@ -207,6 +225,11 @@ def main():
     parser.add_argument('--cls_model', type=str, default='roberta-base')
     parser.add_argument('--num_labels', type=int, default=7)
     parser.add_argument('--evaluator_ckpt', type=str, default=None, help='Path to pretrained GPT2 evaluator ckpt (.pt)')
+    # Reward head (ERC/EC) to make rewards action-dependent
+    parser.add_argument('--egc_align_coef', type=float, default=0.3,
+                        help='Blend factor for action-aware alignment reward in EGC (0-1).')
+    parser.add_argument('--egc_align_scale', type=float, default=1.5,
+                        help='Stretch factor for alignment bonus variance (EGC). >1 amplifies differences.')
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -308,6 +331,16 @@ def main():
         cls = ClassifierEvaluator(args.cls_model, num_labels=args.num_labels, device=args.device)
         evaluator_name = 'NegCE'
 
+    # For EGC: build a deterministic alignment encoder so rewards depend on actions even when gen path is weak
+    egc_target_encoder = None
+    egc_target_dim = None
+    if args.task == 'EGC':
+        if text_encoder is not None:
+            egc_target_encoder = text_encoder
+        else:
+            egc_target_encoder = TextEncoder(task='EGC', egc_model=args.egc_model, device=args.device)
+        egc_target_dim = int(egc_target_encoder.out_dim)
+
     # Dataloaders
     loader_kwargs = dict(collate_fn=collate_fn, batch_size=args.batch_size, shuffle=True)
     val_loader_kwargs = dict(collate_fn=collate_fn, batch_size=args.batch_size, shuffle=False)
@@ -344,8 +377,6 @@ def main():
         if args.task == 'EGC':
             # Prefer true multimodal light-injection when using GPT-2 evaluator.
             if getattr(egc, 'kind', None) == 'gpt2':
-                # tf/af/vf are (B, D_t/a/v); only af/vf are used for injection
-                # try:
                 hyps = egc.generate_with_cross_attn(
                         contexts=[t if t is not None else "" for t in texts],
                         aud_vecs=af,
@@ -358,12 +389,6 @@ def main():
                         top_p=0.9,
 
                     )
-                # except Exception:
-                #     # fallback to prefix-only prompt if anything goes wrong
-                #     hyps = egc.generate_with_weights(
-                #         [t if t is not None else "" for t in texts],
-                #         np.tile(weights, (len(texts), 1))
-                #     )
             else:
                 # BART path (no light-injection) — fallback to textual prefixing
                 hyps = egc.generate_with_weights(
@@ -371,7 +396,28 @@ def main():
                     np.tile(weights, (len(texts), 1))
                 )
             refs = [t if t is not None else "" for t in targets]
-            r = egc.reward_bertscore(hyps, refs)
+            r_gen = egc.reward_bertscore(hyps, refs)
+
+            # Extra alignment reward that depends directly on selector weights (makes actions matter)
+            align_bonus = 0.0
+            if egc_target_encoder is not None and egc_target_dim is not None:
+                with torch.no_grad():
+                    tgt_emb = egc_target_encoder.encode(refs).to(args.device)  # (B, D_tgt)
+                w_t = torch.as_tensor(weights, device=args.device, dtype=tf.dtype)  # (B,3)
+                t_aln = _align_to_dim(tf.to(args.device), egc_target_dim)
+                a_aln = _align_to_dim(af.to(args.device), egc_target_dim)
+                v_aln = _align_to_dim(vf.to(args.device), egc_target_dim)
+                fused = (w_t[:, 0:1] * t_aln) + (w_t[:, 1:2] * a_aln) + (w_t[:, 2:3] * v_aln)
+                fused = F.normalize(fused, dim=-1)
+                tgt_norm = F.normalize(tgt_emb, dim=-1)
+                cos = (fused * tgt_norm).sum(dim=-1)  # in [-1,1]
+                align_bonus = (cos.clamp(-1, 1) + 1.0) * 0.5  # -> [0,1]
+                # stretch around 0.5 to enlarge variance if needed
+                align_bonus = ((align_bonus - 0.5) * args.egc_align_scale + 0.5).clamp(0.0, 1.0)
+                align_bonus = align_bonus.cpu().numpy().astype(np.float32)
+
+            # Blend text reward and alignment reward to keep scale stable
+            r = (1.0 - args.egc_align_coef) * r_gen + args.egc_align_coef * align_bonus
             return r
         else:
             # For ERC/EC, reward from classifier (negative CE)
@@ -428,6 +474,7 @@ def main():
         selector.train()
         total_loss = 0.0
         n_batches = 0
+        action_hist = np.zeros(num_actions, dtype=np.int64)
 
         pbar = tqdm(train_loader, desc=f"[DPO {epoch}]")
         for bidx, (tf, af, vf, hc, texts, targets, labels) in enumerate(pbar, start=1):
@@ -442,6 +489,7 @@ def main():
             # 仅用于监控：贪心动作
             pol_actions = torch.softmax(logits_cur, dim=-1).argmax(dim=-1)
             _ = batch_reward(pol_actions, tf, af, vf, hc, texts, targets, labels, actions)
+            action_hist += np.bincount(pol_actions.detach().cpu().numpy(), minlength=num_actions)
 
             # (2) 离线枚举动作 → 构造 (a+, a-) 偏好对
             with torch.no_grad():
@@ -486,11 +534,13 @@ def main():
             if (bidx % log_interval) == 0:
                 pbar.set_postfix({"DPO": f"{loss_val:.4f}"})
 
+        print(f"[DPO {epoch}] action_hist={action_hist.tolist()}")
         return total_loss / max(1, n_batches)
 
     def validate_mean_reward(log_interval=10):
         selector.eval()
         all_rewards = []
+        action_hist = np.zeros(num_actions, dtype=np.int64)
         with torch.no_grad():
             pbar = tqdm(val_loader, desc="[Validate]")
             for bidx, (tf, af, vf, hc, texts, targets, labels) in enumerate(pbar, start=1):
@@ -501,6 +551,7 @@ def main():
                     hc = hc.to(args.device)
                 logits = _selector_logits(tf, af, vf, hc)
                 acts = torch.softmax(logits, dim=-1).argmax(dim=-1)  # (B,)
+                action_hist += np.bincount(acts.detach().cpu().numpy(), minlength=num_actions)
 
                 # 向量化计算该 batch 的 reward（一次性），并记录
                 r = batch_reward(acts, tf, af, vf, hc, texts, targets, labels, actions)  # np.ndarray (B,)
@@ -509,6 +560,10 @@ def main():
                 # 简洁可视化：每 log_interval 个 batch 显示一次该 batch 的均值
                 if (bidx % log_interval) == 0:
                     pbar.set_postfix({"R": f"{float(np.mean(r)):.4f}"})
+
+        if action_hist.sum() > 0:
+            hist_pct = (action_hist / action_hist.sum()).round(3).tolist()
+            print(f"[Validate] action_hist={action_hist.tolist()} pct={hist_pct}")
 
         return float(np.mean(all_rewards)) if all_rewards else 0.0
 
