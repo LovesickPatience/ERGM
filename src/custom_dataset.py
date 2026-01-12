@@ -510,3 +510,263 @@ class PadCollate():
                 emotion_labels,
             )
         return collate
+
+    def meld_collate_without_prefix(self, tokenizer, a_dim: int = 1024, v_dim: int = 768):
+        """
+        Collate for MELDDialoguePKLDataset without modal prefix tokens.
+        """
+        def collate(batch):
+            input_ids_list: list = []
+            token_type_ids_list: list = []
+            labels_list: list = []
+            imgs: list = []
+            auds: list = []
+            contexts: list = []
+            emotion_labels: list = []
+
+            eos_id = getattr(self.args, 'eos_id', self.eos_id)
+            sp_id = getattr(self.args, 'sp1_id', 0)  # use single speaker id
+            max_len = getattr(self.args, 'max_len', 512)
+
+            _EMO_MAP = getattr(self.args, 'emo_map', None)
+            if _EMO_MAP is None:
+                _EMO_MAP = {
+                    'anger': 0,
+                    'neutral': 1,
+                    'sadness': 2,
+                    'surprise': 3,
+                    'joy': 4,
+                    'fear': 5,
+                    'disgust': 6,
+                }
+
+            def _stack_1d(x):
+                if isinstance(x, torch.Tensor):
+                    t = x
+                else:
+                    t = torch.as_tensor(x)
+                if t.ndim == 2:
+                    t = t.mean(dim=0)
+                return t.to(torch.float32)
+
+            for b in batch:
+                ctx_text = b.get('ctx_text', '')
+                label_text = b.get('label_text', '')
+                contexts.append(ctx_text)
+
+                enc_ctx = tokenizer(
+                    ctx_text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )
+                ids_ctx = enc_ctx.input_ids[0].to(torch.long)
+
+                enc_resp = tokenizer(
+                    label_text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )
+                ids_resp = enc_resp.input_ids[0].to(torch.long)
+
+                total_len = ids_ctx.size(0) + ids_resp.size(0)
+                if total_len > max_len:
+                    overflow = total_len - max_len
+                    if overflow <= ids_ctx.size(0):
+                        ids_ctx = ids_ctx[overflow:]
+                    else:
+                        overflow2 = overflow - ids_ctx.size(0)
+                        ids_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
+                        if overflow2 < ids_resp.size(0):
+                            ids_resp = ids_resp[overflow2:]
+                        else:
+                            ids_resp = ids_resp[-1:].clone()
+
+                input_ids_full = torch.cat([ids_ctx, ids_resp], dim=0)
+                tt_full = torch.full((input_ids_full.size(0),), sp_id, dtype=torch.long)
+                labels_full = torch.cat([
+                    torch.full((ids_ctx.size(0),), -100, dtype=torch.long),
+                    ids_resp.clone()
+                ], dim=0)
+
+                input_ids_list.append(input_ids_full)
+                token_type_ids_list.append(tt_full)
+                labels_list.append(labels_full)
+
+                af_src = b.get('audio_feats', None)
+                if af_src is None:
+                    af_src = b.get('audio_feat', None)
+                vf_src = b.get('video_feats', None)
+                if vf_src is None:
+                    vf_src = b.get('video_feat', None)
+                af = _stack_1d(af_src) if af_src is not None else torch.zeros(a_dim, dtype=torch.float32)
+                vf = _stack_1d(vf_src) if vf_src is not None else torch.zeros(v_dim, dtype=torch.float32)
+                seq_len = input_ids_full.size(0)
+                imgs.append([vf.clone() for _ in range(seq_len)])
+                auds.append([af.clone() for _ in range(seq_len)])
+
+                emo_label_val = b.get('emotion_label', None)
+                if emo_label_val is None:
+                    emo_label_val = _EMO_MAP.get(str(b.get('erc_label_text', 'neutral')).lower(), 1)
+                emotion_labels.append(int(emo_label_val))
+
+            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=eos_id)
+            token_type_ids = torch.nn.utils.rnn.pad_sequence(token_type_ids_list, batch_first=True, padding_value=sp_id)
+            labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+
+            return (
+                input_ids,
+                token_type_ids,
+                labels,
+                imgs,
+                auds,
+                contexts,
+                emotion_labels,
+            )
+        return collate
+
+    def meld_collate(self, tokenizer, a_dim: int = 1024, v_dim: int = 768, add_modal_prefix: bool = False):
+        """
+        Collate for MELDDialoguePKLDataset (no speaker tokens, 7 emotions).
+        """
+        def collate(batch):
+            input_ids_list: list = []
+            token_type_ids_list: list = []
+            labels_list: list = []
+            imgs: list = []
+            auds: list = []
+            contexts: list = []
+            emotion_labels: list = []
+
+            eos_id = getattr(self.args, 'eos_id', self.eos_id)
+            sp_id = getattr(self.args, 'sp1_id', 0)  # use single speaker id
+            max_len = getattr(self.args, 'max_len', 512)
+            img_tok = getattr(self.args, 'img_token', '<img>')
+            aud_tok = getattr(self.args, 'aud_token', '<aud>')
+            img_tid = None
+            aud_tid = None
+            if add_modal_prefix:
+                try:
+                    img_tid = tokenizer.convert_tokens_to_ids(img_tok)
+                except Exception:
+                    img_tid = None
+                try:
+                    aud_tid = tokenizer.convert_tokens_to_ids(aud_tok)
+                except Exception:
+                    aud_tid = None
+
+            # emotion map for MELD (7 classes)
+            _EMO_MAP = getattr(self.args, 'emo_map', None)
+            if _EMO_MAP is None:
+                _EMO_MAP = {
+                    'anger': 0,
+                    'neutral': 1,
+                    'sadness': 2,
+                    'surprise': 3,
+                    'joy': 4,
+                    'fear': 5,
+                    'disgust': 6,
+                }
+
+            def _stack_1d(x):
+                if isinstance(x, torch.Tensor):
+                    t = x
+                else:
+                    t = torch.as_tensor(x)
+                if t.ndim == 2:
+                    t = t.mean(dim=0)
+                return t.to(torch.float32)
+
+            for b in batch:
+                ctx_text = b.get('ctx_text', '')
+                label_text = b.get('label_text', '')
+                contexts.append(ctx_text)
+
+                enc_ctx = tokenizer(
+                    ctx_text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )
+                ids_ctx = enc_ctx.input_ids[0].to(torch.long)
+
+                enc_resp = tokenizer(
+                    label_text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )
+                ids_resp = enc_resp.input_ids[0].to(torch.long)
+
+                prefix_ids = []
+                if add_modal_prefix:
+                    if img_tid is not None:
+                        prefix_ids.append(img_tid)
+                    if aud_tid is not None:
+                        prefix_ids.append(aud_tid)
+                prefix_ids = torch.tensor(prefix_ids, dtype=torch.long)
+
+                total_len = prefix_ids.size(0) + ids_ctx.size(0) + ids_resp.size(0)
+                if total_len > max_len:
+                    overflow = total_len - max_len
+                    if overflow <= ids_ctx.size(0):
+                        ids_ctx = ids_ctx[overflow:]
+                    else:
+                        overflow2 = overflow - ids_ctx.size(0)
+                        ids_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
+                        if overflow2 < ids_resp.size(0):
+                            ids_resp = ids_resp[overflow2:]
+                        else:
+                            ids_resp = ids_resp[-1:].clone()
+
+                input_ids_full = torch.cat([prefix_ids, ids_ctx, ids_resp], dim=0)
+                tt_full = torch.full((input_ids_full.size(0),), sp_id, dtype=torch.long)
+                labels_full = torch.cat([
+                    torch.full((prefix_ids.size(0) + ids_ctx.size(0),), -100, dtype=torch.long),
+                    ids_resp.clone()
+                ], dim=0)
+
+                input_ids_list.append(input_ids_full)
+                token_type_ids_list.append(tt_full)
+                labels_list.append(labels_full)
+
+                af_src = b.get('audio_feats', None)
+                if af_src is None:
+                    af_src = b.get('audio_feat', None)
+                vf_src = b.get('video_feats', None)
+                if vf_src is None:
+                    vf_src = b.get('video_feat', None)
+                af = _stack_1d(af_src) if af_src is not None else torch.zeros(a_dim, dtype=torch.float32)
+                vf = _stack_1d(vf_src) if vf_src is not None else torch.zeros(v_dim, dtype=torch.float32)
+                seq_len = input_ids_full.size(0)
+                imgs.append([vf.clone() for _ in range(seq_len)])
+                auds.append([af.clone() for _ in range(seq_len)])
+
+                emo_label_val = b.get('emotion_label', None)
+                if emo_label_val is None:
+                    emo_label_val = _EMO_MAP.get(str(b.get('erc_label_text', 'neutral')).lower(), 1)
+                emotion_labels.append(int(emo_label_val))
+
+            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=eos_id)
+            token_type_ids = torch.nn.utils.rnn.pad_sequence(token_type_ids_list, batch_first=True, padding_value=sp_id)
+            labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+
+            return (
+                input_ids,
+                token_type_ids,
+                labels,
+                imgs,
+                auds,
+                contexts,
+                emotion_labels,
+            )
+        return collate

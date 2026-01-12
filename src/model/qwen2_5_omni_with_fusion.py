@@ -1107,10 +1107,10 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
         # Projections for pre-extracted modality embeddings (e.g., 64-dim -> hidden_size)
         # NOTE: if your upstream encoders output a different dim, change 64 accordingly.
-        self.auds_proj = nn.Linear(64, config.text_config.hidden_size, bias=False)
-        self.imgs_proj = nn.Linear(64, config.text_config.hidden_size, bias=False)
+        self.auds_proj = nn.Linear(1024, config.text_config.hidden_size, bias=False)
+        self.imgs_proj = nn.Linear(768, config.text_config.hidden_size, bias=False)
 
-        self.num_emotions = 9
+        self.num_emotions = 7
         self.emotion_head = nn.Linear(config.text_config.hidden_size, self.num_emotions, bias=False)
 
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1

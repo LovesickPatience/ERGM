@@ -15,7 +15,7 @@ from src.model.model import *
 from custom_dataset import *
 from eval.evaluate import Evaluator
 from selector.selector_models import SelectorConfig, build_selector
-from selector.data_preprocess import IEMOCAPDialoguePKLDataset
+from selector.data_preprocess import IEMOCAPDialoguePKLDataset, MELDDialoguePKLDataset
 
 
 def print_custom(context, ref, sentence):
@@ -166,6 +166,31 @@ class Manager:
                 valid_set = IEMOCAPDialoguePKLDataset(pkl_path=val_pkl_list[0], json_path=self.args.iemocap_text_json, split='val')
 
                 collate = ppd.iemocap_collate(self.tokenizer)
+                self.train_loader = DataLoader(
+                    train_set, collate_fn=collate, shuffle=True,
+                    batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                )
+                self.valid_loader = DataLoader(
+                    valid_set, collate_fn=collate, shuffle=False,
+                    batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                )
+            elif getattr(self.args, 'dataset', 'ERGM') == 'MELD':
+                # MELD: text JSON + separate A/V PKLs with keys {"0": train, "1": val}
+                assert self.args.meld_text_json and self.args.meld_aud_pkl and self.args.meld_img_pkl, \
+                    "For MELD, please set --meld_text_json, --meld_aud_pkl, --meld_img_pkl"
+                train_set = MELDDialoguePKLDataset(
+                    json_path=self.args.meld_text_json,
+                    audio_pkl=self.args.meld_aud_pkl,
+                    video_pkl=self.args.meld_img_pkl,
+                    split="train",
+                )
+                valid_set = MELDDialoguePKLDataset(
+                    json_path=self.args.meld_text_json_val,
+                    audio_pkl=self.args.meld_aud_pkl,
+                    video_pkl=self.args.meld_img_pkl,
+                    split="val",
+                )
+                collate = ppd.meld_collate(self.tokenizer)
                 self.train_loader = DataLoader(
                     train_set, collate_fn=collate, shuffle=True,
                     batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
@@ -709,16 +734,20 @@ if __name__ == "__main__":
     parser.add_argument("--selector_temperature", type=float, default=1.0, help="离散策略温度：>1更平；<1更尖锐；一般 1.0 即可")
     parser.add_argument("--selector_enable", type=str, choices=["off", "val", "train_eval"], default="off",
                         help="off=不用selector；val=只在验证/测试用；train_eval=训练和验证都用")
-    parser.add_argument("--dataset", type=str, default="ERGM", choices=["ERGM", "IEMOCAP"], help="Choose data pipeline. IEMOCAP uses PKL+JSON via IEMOCAPDialoguePKLDataset.")
+    parser.add_argument("--dataset", type=str, default="ERGM", choices=["ERGM", "IEMOCAP", "MELD"], help="Choose data pipeline. IEMOCAP uses PKL+JSON via IEMOCAPDialoguePKLDataset. MELD uses JSON+separate A/V PKLs.")
     parser.add_argument("--train_pkls", type=str, default=None, help="(IEMOCAP) path to train PKL or a comma-separated list of PKLs")
     parser.add_argument("--val_pkls", type=str, default=None, help="(IEMOCAP) path to val PKL or a comma-separated list of PKLs")
     parser.add_argument("--iemocap_text_json", type=str, default=None, help="(IEMOCAP) path to JSON holding raw text/dialogue info to be encoded")
+    parser.add_argument("--meld_text_json", type=str, default=None, help="(MELD) path to meld_diadict.json")
+    parser.add_argument("--meld_text_json_val", type=str, default=None, help="(MELD) path to meld_diadict_val.json")
+    parser.add_argument("--meld_aud_pkl", type=str, default=None, help="(MELD) path to audio features PKL with keys {'0','1'}")
+    parser.add_argument("--meld_img_pkl", type=str, default=None, help="(MELD) path to image/video features PKL with keys {'0','1'}")
     
     args = parser.parse_args()
 
     model_name = args.model_type.split("/")[-1]
-    args.data_dir = os.path.join(args.data_dir, model_name)
-    args.ckpt_dir = os.path.join(args.ckpt_dir, model_name)
+    args.data_dir = os.path.join(args.data_dir, model_name, args.dataset.lower())
+    args.ckpt_dir = os.path.join(args.ckpt_dir, model_name, args.dataset.lower())
     
     if args.mode == 'train':
         manager = Manager(args)

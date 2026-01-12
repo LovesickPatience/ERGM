@@ -19,9 +19,8 @@ if not exist "%OUT_DIR%" (
 REM Loop over mp4/mkv/avi (one level, adjust `for /r` to recurse)
 for %%f in ("%VID_DIR%\*.mp4" "%VID_DIR%\*.mkv" "%VID_DIR%\*.avi") do (
     if exist "%%~f" (
-        set "FILE=%%~nf"
         echo Extracting audio from: %%~f
-        ffmpeg -y -i "%%~f" -vn -ar 16000 -ac 1 -c:a pcm_s16le "%OUT_DIR%\%%~nxf.wav"
+        ffmpeg -y -i "%%~f" -vn -ar 16000 -ac 1 -c:a pcm_s16le "%OUT_DIR%\%%~nf.wav"
     )
 )
 

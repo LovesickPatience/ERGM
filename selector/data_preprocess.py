@@ -348,3 +348,90 @@ class IEMOCAPDialoguePKLDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.samples[idx]
+
+
+class MELDDialoguePKLDataset(Dataset):
+    """
+    Use pre-extracted A/V features (separate PKLs) and JSON diadict (same format as IEMOCAP) for MELD.
+    audio_pkl / video_pkl structure:
+        {"0": {utt_id -> feat}, "1": {utt_id -> feat}}
+        where key "0" = train, "1" = val.
+    """
+    SPLIT_KEY = {"train": "0", "val": "1", "test": "1"}
+
+    def __init__(self, json_path: str, audio_pkl: str, video_pkl: str, split: str = "train",
+                 bos: str = None, eos: str = "</s>"):
+        super().__init__()
+        self.meta = _load_json(json_path)
+        with open(audio_pkl, "rb") as f:
+            a_blob = pickle.load(f)
+        with open(video_pkl, "rb") as f:
+            v_blob = pickle.load(f)
+        key = self.SPLIT_KEY.get(split, "0")
+        self.audio_bank: Dict[str, Any] = a_blob.get(key, {}) if isinstance(a_blob, dict) else {}
+        self.video_bank: Dict[str, Any] = v_blob.get(key, {}) if isinstance(v_blob, dict) else {}
+        self.samples: List[Dict[str, Any]] = []
+        self.bos = bos
+        self.eos = eos
+
+        # infer default dims from banks
+        def _infer_dim(bank: Dict[str, Any], default: int = 64) -> int:
+            for v in bank.values():
+                t = torch.tensor(v)
+                return t.shape[-1]
+            return default
+        a_dim = _infer_dim(self.audio_bank, 1024)
+        v_dim = _infer_dim(self.video_bank, 768)
+        # default time dims for zero-fill
+        a_T_default = 1
+        v_T_default = 32
+
+        for dlg_id, utts in _iter_dialogues(self.meta, session_filter=None):
+            if len(utts) == 0:
+                continue
+            utts = sorted(utts, key=lambda u: float(u.get("start_time", 0.0)))
+            for idx, label_utt in enumerate(utts):
+                ctx_utts = utts[:idx]  # rolling concat including empty for first utt
+                ctx_text, utt_bounds, token_offsets = _concat_text_and_boundaries(
+                    ctx_utts, self.bos, self.eos, speaker_tokens=None
+                )
+                ctx_ids = [u.get("utterance_id") for u in ctx_utts]
+
+                a_feats, v_feats = [], []
+                for uid in ctx_ids:
+                    # audio
+                    if uid in self.audio_bank:
+                        a = torch.tensor(self.audio_bank[uid])
+                        if a.ndim == 1:
+                            a = a.unsqueeze(0)
+                    else:
+                        a = torch.zeros((a_T_default, a_dim))
+                    a_feats.append(a.mean(dim=0))
+                    # video/img
+                    if uid in self.video_bank:
+                        v = torch.tensor(self.video_bank[uid])
+                        if v.ndim == 1:
+                            v = v.unsqueeze(0)
+                    else:
+                        v = torch.zeros((v_T_default, v_dim))
+                    v_feats.append(v.mean(dim=0))
+
+                a_stack = torch.stack(a_feats, dim=0) if a_feats else torch.zeros(1, a_dim)
+                v_stack = torch.stack(v_feats, dim=0) if v_feats else torch.zeros(1, v_dim)
+
+                self.samples.append({
+                    "dialogue_id": dlg_id,
+                    "ctx_text": ctx_text,
+                    "utt_bounds": utt_bounds,
+                    "token_offsets": token_offsets,
+                    "audio_feats": a_stack,
+                    "video_feats": v_stack,
+                    "erc_label_text": label_utt.get("emo", "neutral"),
+                    "label_text": label_utt.get("text", ""),
+                })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
