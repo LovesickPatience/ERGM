@@ -823,8 +823,8 @@ if __name__ == "__main__":
                               rescale_with_baseline=True, )
 
         hypotheses, references, true_labels, losses = manager.test()
-        os.makedirs(args.output_dir, exist_ok=True)
-        infer_dump_path = os.path.join(args.output_dir, args.dataset.lower(),f"{args.ckpt_name}_infer_outputs.pkl")
+        infer_dump_path = os.path.join(args.output_dir, args.dataset.lower(), f"{args.ckpt_name}_infer_outputs.pkl")
+        os.makedirs(os.path.dirname(infer_dump_path), exist_ok=True)
         with open(infer_dump_path, "wb") as f:
             pickle.dump(
                 {
