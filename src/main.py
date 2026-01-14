@@ -1,5 +1,7 @@
 import sys
 import argparse
+import os
+import pickle
 import random
 import numpy as np
 
@@ -781,7 +783,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_turns", type=int, default=10, help="The maximum number of dialogue histories to include.")
     parser.add_argument("--top_p", type=float, default=0.95, help="The top-p value for nucleus sampling decoding.")
     parser.add_argument("--ckpt_dir", type=str, default="/root/autodl-tmp/ERGM-main/save_model", help="The directory name for saved checkpoints.")
-    parser.add_argument("--output_dir", type=str, default="outputs", help="The directory name for outputs.")
+    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/ERGM-main/eval/output", help="The directory name for outputs.")
     parser.add_argument("--ckpt_name", type=str, default=None, help="The name of the trained checkpoint (without extension).")
     parser.add_argument("--selector_ckpt", type=str, default="checkpoints/selector/latest.pt", help="路径指向你训练好的 selector checkpoint（.pt）")
     parser.add_argument("--selector_device", type=str, default=None, help="selector 推理放到哪块设备；默认跟主模型一致")
@@ -815,14 +817,27 @@ if __name__ == "__main__":
     elif args.mode == 'infer':
         assert args.ckpt_name is not None, "Please specify the trained model checkpoint using --ckpt_name."
         manager = Manager(args)
-        
-        hypotheses, references, true_labels, losses = manager.test()
 
         evaluator = Evaluator(device=manager.args.device,
                               bert_model_path='/root/autodl-tmp/ERGM-main/tools/models/roberta-large',
                               baseline_path="/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large.tsv",
                               num_layers=24,
                               rescale_with_baseline=True, )
+        
+        hypotheses, references, true_labels, losses = manager.test()
+        os.makedirs(args.output_dir, exist_ok=True)
+        infer_dump_path = os.path.join(args.output_dir, args.dataset.lower(), f"{args.ckpt_name}_infer_outputs.pkl")
+        with open(infer_dump_path, "wb") as f:
+            pickle.dump(
+                {
+                    "hypotheses": hypotheses,
+                    "references": references,
+                    "true_labels": true_labels,
+                    "losses": losses,
+                },
+                f,
+            )
+
         
         final_metrics = evaluator.evaluate_all(
             hypotheses=hypotheses,

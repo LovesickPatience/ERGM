@@ -1,5 +1,7 @@
 import sys
 import argparse
+import os
+import pickle
 import time
 
 import random
@@ -814,13 +816,25 @@ if __name__ == "__main__":
         assert args.ckpt_name is not None, "Please specify the trained model checkpoint using --ckpt_name."
         manager = Manager(args)
 
-        hypotheses, references, true_labels, losses = manager.test()
-
         evaluator = Evaluator(device=manager.args.device,
                               bert_model_path='/root/autodl-tmp/ERGM-main/tools/models/roberta-large',
                               baseline_path="/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large.tsv",
                               num_layers=24,
-                              rescale_with_baseline=True,)
+                              rescale_with_baseline=True, )
+
+        hypotheses, references, true_labels, losses = manager.test()
+        os.makedirs(args.output_dir, exist_ok=True)
+        infer_dump_path = os.path.join(args.output_dir, args.dataset.lower(),f"{args.ckpt_name}_infer_outputs.pkl")
+        with open(infer_dump_path, "wb") as f:
+            pickle.dump(
+                {
+                    "hypotheses": hypotheses,
+                    "references": references,
+                    "true_labels": true_labels,
+                    "losses": losses,
+                },
+                f,
+            )
 
         final_metrics = evaluator.evaluate_all(
             hypotheses=hypotheses,
