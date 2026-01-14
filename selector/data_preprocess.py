@@ -368,8 +368,12 @@ class MELDDialoguePKLDataset(Dataset):
         with open(video_pkl, "rb") as f:
             v_blob = pickle.load(f)
         key = self.SPLIT_KEY.get(split, "0")
-        self.audio_bank: Dict[str, Any] = a_blob.get(key, {}) if isinstance(a_blob, dict) else {}
-        self.video_bank: Dict[str, Any] = v_blob.get(key, {}) if isinstance(v_blob, dict) else {}
+        if split != "test":
+            self.audio_bank: Dict[str, Any] = a_blob.get(key, {}) if isinstance(a_blob, dict) else {}
+            self.video_bank: Dict[str, Any] = v_blob.get(key, {}) if isinstance(v_blob, dict) else {}
+        else:
+            self.audio_bank = a_blob if isinstance(a_blob, dict) else {}
+            self.video_bank = v_blob if isinstance(v_blob, dict) else {}
         self.samples: List[Dict[str, Any]] = []
         self.bos = bos
         self.eos = eos
@@ -380,8 +384,10 @@ class MELDDialoguePKLDataset(Dataset):
                 t = torch.tensor(v)
                 return t.shape[-1]
             return default
-        a_dim = _infer_dim(self.audio_bank, 1024)
-        v_dim = _infer_dim(self.video_bank, 768)
+        # a_dim = _infer_dim(self.audio_bank, 1024)
+        # v_dim = _infer_dim(self.video_bank, 768)
+        a_dim = 1024
+        v_dim = 768
         # default time dims for zero-fill
         a_T_default = 1
         v_T_default = 32
