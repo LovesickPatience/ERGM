@@ -1,6 +1,4 @@
 import math
-import os
-import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -13,23 +11,14 @@ from torch.nn import functional as F
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-    TokenClassifierOutput,
+    BaseModelOutputWithPastAndCrossAttentions,
+    CausalLMOutputWithCrossAttentions,
 )
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel, SequenceSummary
 from transformers.pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_conv1d_layer
 from transformers.utils import (
-    ModelOutput,
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
     logging,
-    replace_return_docstrings,
 )
-from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 
 logger = logging.get_logger(__name__)
@@ -45,11 +34,12 @@ GPT2_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "distilgpt2",
 ]
 
+
 @dataclass
-class CausalLMOutputWithEmotionClassification(CausalLMOutputWithPast):
+class CausalLMOutputWithEmotionClassification(CausalLMOutputWithCrossAttentions):
     """
     Base class for causal language model (or autoregressive) outputs.
-    This class extends CausalLMOutputWithPast to include emotion classification logits.
+    This class extends CausalLMOutputWithCrossAttentions to include emotion classification logits.
     """
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
@@ -57,6 +47,7 @@ class CausalLMOutputWithEmotionClassification(CausalLMOutputWithPast):
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
 class GPT2Attention(nn.Module):
@@ -128,7 +119,7 @@ class GPT2Attention(nn.Module):
 
         if not self.is_cross_attention:
             query_length, key_length = query.size(-2), key.size(-2)
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            causal_mask = self.bias[:, :, key_length - query_length: key_length, :key_length]
             mask_value = torch.finfo(attn_weights.dtype).min
             mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
             attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
@@ -165,7 +156,7 @@ class GPT2Attention(nn.Module):
 
         if not self.is_cross_attention:
             query_length, key_length = query.size(-2), key.size(-2)
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            causal_mask = self.bias[:, :, key_length - query_length: key_length, :key_length]
             mask_value = torch.finfo(attn_weights.dtype).min
             mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
             attn_weights = torch.where(causal_mask, attn_weights, mask_value)
@@ -197,15 +188,15 @@ class GPT2Attention(nn.Module):
         return tensor.view(new_shape)
 
     def forward(
-        self,
-        hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
+            self,
+            hidden_states: Optional[Tuple[torch.FloatTensor]],
+            layer_past: Optional[Tuple[torch.Tensor]] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = False,
+            output_attentions: Optional[bool] = False,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn"):
@@ -249,6 +240,7 @@ class GPT2Attention(nn.Module):
 
         return outputs
 
+
 class GPT2MLP(nn.Module):
     def __init__(self, intermediate_size, config):
         super().__init__()
@@ -271,22 +263,27 @@ class GPT2Block(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
-        config.add_cross_attention = False
+        config.add_cross_attention = True
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPT2Attention(config, layer_idx=layer_idx)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
+        if config.add_cross_attention:
+            self.crossattention = GPT2Attention(config, is_cross_attention=True, layer_idx=layer_idx)
+            self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         self.mlp = GPT2MLP(inner_dim, config)
 
     def forward(
-        self,
-        hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
+            self,
+            hidden_states: Optional[Tuple[torch.FloatTensor]],
+            layer_past: Optional[Tuple[torch.Tensor]] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = False,
+            output_attentions: Optional[bool] = False,
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
@@ -302,6 +299,25 @@ class GPT2Block(nn.Module):
         outputs = attn_outputs[1:]
         hidden_states = attn_output + residual
 
+        if encoder_hidden_states is not None:
+            if not hasattr(self, "crossattention"):
+                raise ValueError(
+                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with "
+                    "cross-attention layers by setting `config.add_cross_attention=True`"
+                )
+            residual = hidden_states
+            hidden_states = self.ln_cross_attn(hidden_states)
+            cross_attn_outputs = self.crossattention(
+                hidden_states,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions,
+            )
+            attn_output = cross_attn_outputs[0]
+            hidden_states = residual + attn_output
+            outputs = outputs + cross_attn_outputs[2:]
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
@@ -361,8 +377,17 @@ class GPT2Model(GPT2PreTrainedModel):
         self.embed_dim = config.hidden_size
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-        self.img_proj = nn.Linear(64, self.embed_dim)
-        self.aud_proj = nn.Linear(64, self.embed_dim)
+        # Fusion attentions: separate self-attn and cross-attn
+        self.mha_self = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=getattr(self.config, "n_head", self.config.num_attention_heads),
+            batch_first=True,
+        )
+        self.mha_cross = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=getattr(self.config, "n_head", self.config.num_attention_heads),
+            batch_first=True,
+        )
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
@@ -372,17 +397,6 @@ class GPT2Model(GPT2PreTrainedModel):
         self.device_map = None
         self.gradient_checkpointing = False
         self.post_init()
-
-        self.model_parallel = False
-        self.device_map = None
-        self.first_device = "cuda"
-        self.last_device = "cuda"
-        self.wte = self.wte.to("cuda")
-        self.wpe = self.wpe.to("cuda")
-        for index in range(len(self.h)):
-            self.h[index] = self.h[index].to("cuda")
-        self.ln_f = self.ln_f.to("cuda")
-        torch.cuda.empty_cache()
 
     def get_input_embeddings(self):
         return self.wte
@@ -394,39 +408,25 @@ class GPT2Model(GPT2PreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.h[layer].attn.prune_heads(heads)
 
-    def _to_tensor_pool_seq(self, x, device, dtype):
-        # x: list[Tensor] / Tensor / ndarray
-        if isinstance(x, list):
-            x = torch.stack([torch.as_tensor(v) if not isinstance(v, torch.Tensor) else v for v in x], dim=0)
-        elif not isinstance(x, torch.Tensor):
-            x = torch.as_tensor(x)
-        x = x.to(device=device, dtype=dtype)  # (T, D) or (D,)
-        if x.dim() == 1:
-            return x  # (D,)
-        return x.mean(dim=0)  # (D,)
-
-    def _ensure_linear(self, layer_attr: str, in_dim: int, out_dim: int, device, dtype):
-        layer = getattr(self, layer_attr, None)
-        if layer is None or (hasattr(layer, "in_features") and layer.in_features != in_dim):
-            new = torch.nn.Linear(in_dim, out_dim).to(device=device, dtype=dtype)
-            setattr(self, layer_attr, new)
-        return getattr(self, layer_attr)
-
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        imgs=None, auds=None, modal_gate: Optional[torch.Tensor] = None, modal_main_idx: Optional[torch.Tensor] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            token_type_ids: Optional[torch.LongTensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            main_idx = None,
+            imgs=None, auds=None, caption_ids: Optional[torch.LongTensor] = None,
+            gated_weight=None, gated_weights=None,
+    ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -447,18 +447,18 @@ class GPT2Model(GPT2PreTrainedModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
+        # 兼容命名：外部可能传 gated_weight 或 gated_weights
+        gate_w = gated_weights if gated_weights is not None else gated_weight
+        if gate_w is not None and gate_w.dim() == 1:
+            gate_w = gate_w.unsqueeze(0)
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        # modal_gate: (B,3) -> [text, audio, video] 权重，默认全 1
-        gate_text = gate_aud = gate_img = None
-        if modal_gate is not None:
-            if modal_gate.dim() == 1:
-                modal_gate = modal_gate.unsqueeze(0)
-            gate_text = modal_gate[:, 0].view(-1, 1, 1).to(inputs_embeds.device)
-            gate_aud = modal_gate[:, 1].view(-1, 1).to(inputs_embeds.device)
-            gate_img = modal_gate[:, 2].view(-1, 1).to(inputs_embeds.device)
-            inputs_embeds = inputs_embeds * gate_text
+        caption_embeds = None
+        if caption_ids is not None:
+            caption_ids = caption_ids.view(-1, input_shape[-1])
+            caption_embeds = self.wte(caption_ids)
+            encoder_hidden_states = caption_embeds
 
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
@@ -473,86 +473,161 @@ class GPT2Model(GPT2PreTrainedModel):
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
+        # Keep a copy of the original 0/1 attention mask for padding indicators
+        attn_mask_raw = attention_mask.clone() if attention_mask is not None else None
         if attention_mask is not None:
             attention_mask = attention_mask.view(batch_size, -1)
             attention_mask = attention_mask[:, None, None, :]
             attention_mask = attention_mask.to(dtype=self.dtype)
             attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
 
+        if self.config.add_cross_attention and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            encoder_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_attention_mask = None
 
         head_mask = self.get_head_mask(head_mask, self.config.n_layer)
 
-        # 原处理imgs和auds模态拼接方式
-        # if imgs is not None:
-        #     for i in range(inputs_embeds.shape[0]):
-        #         inputs_embeds[i, 0] = inputs_embeds[i, 0] + imgs[i][0]
-        #         inputs_embeds[i, 1] = inputs_embeds[i, 1] + auds[i].unsqueeze(0)
+        B, L, H = inputs_embeds.shape
 
-        B = inputs_embeds.size(0)
-        H = inputs_embeds.size(-1)
-        dev = inputs_embeds.device
-        dt = inputs_embeds.dtype
+        # 模态融合：仅当提供 imgs/auds 时执行
+        # 仅在没有使用 past_key_values（即首次整体前向/解码第 1 步）时进行模态融合
+        if past_key_values is None and imgs is not None and auds is not None and isinstance(main_idx, torch.Tensor):
+            txt = inputs_embeds
+            # 原始 padding mask：形状 (B, L)，True 表示 pad
+            if attn_mask_raw is not None:
+                # attn_mask_raw 形状 (B, L_pad) 或 (B,1,1,L_pad)，先展平再取 pad 标记
+                if attn_mask_raw.dim() > 2:
+                    flat_mask = attn_mask_raw.view(B, -1)
+                else:
+                    flat_mask = attn_mask_raw
+                txt_pad_mask = (flat_mask == 0)
+            else:
+                txt_pad_mask = None
+            # 对单向量模态构造全 False 的 key_padding_mask
+            aud_kmask = torch.zeros(auds.size(0), auds.size(1), dtype=torch.bool, device=device)
+            img_kmask = torch.zeros(imgs.size(0), imgs.size(1), dtype=torch.bool, device=device)
 
-        img_proj_batch = None
-        aud_proj_batch = None
+            # 轻量注入：为每个样本生成一个融合伪 token
+            fused_tokens = torch.zeros(B, 1, H, device=device, dtype=inputs_embeds.dtype)
 
-        if imgs is not None:
-            pooled = torch.stack([self._to_tensor_pool_seq(v, dev, dt) for v in imgs], dim=0)  # (B, D_img)
-            D_img = pooled.size(-1)
-            img_proj = self._ensure_linear("img_proj", D_img, H, dev, dt)  # 自适应 in_dim
-            img_proj_batch = img_proj(pooled)  # (B, H)
+            text_sel = (main_idx == 0)
+            if torch.any(text_sel):
+                txt_mask_sel = txt_pad_mask[text_sel] if txt_pad_mask is not None else None
+                txt_sel = txt[text_sel]
+                aud_sel = auds[text_sel]
+                img_sel = imgs[text_sel]
 
-        if auds is not None:
-            pooled = torch.stack([self._to_tensor_pool_seq(v, dev, dt) for v in auds], dim=0)  # (B, D_aud)
-            D_aud = pooled.size(-1)
-            aud_proj = self._ensure_linear("aud_proj", D_aud, H, dev, dt)
-            aud_proj_batch = aud_proj(pooled)  # (B, H)
+                if txt_mask_sel is not None and txt_mask_sel.size(1) != txt_sel.size(1):
+                    txt_mask_sel = txt_mask_sel[:, :txt_sel.size(1)]
 
-        # ---- 占位符定位注入（替代“前两个 token 注入”）----
-        # 需要在 main.py 里把这些 id 注入到 config（见下方说明）
-        img_id = getattr(self.config, "img_id", None)
-        aud_id = getattr(self.config, "aud_id", None)
+                main_self, _ = self.mha_self(txt_sel, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
+                cross_a, _ = self.mha_cross(txt_sel, aud_sel, aud_sel, key_padding_mask=aud_kmask[text_sel])
+                cross_v, _ = self.mha_cross(txt_sel, img_sel, img_sel, key_padding_mask=img_kmask[text_sel])
 
-        # 做过投影 + LN 的 batch 向量
-        img_vec = F.layer_norm(img_proj_batch, img_proj_batch.shape[-1:]) if img_proj_batch is not None else None
-        aud_vec = F.layer_norm(aud_proj_batch, aud_proj_batch.shape[-1:]) if aud_proj_batch is not None else None
+                if gate_w is not None:
+                    gw = gate_w[text_sel]  # (B_sel,3)
+                    w_sum = gw.sum(dim=-1, keepdim=True) + 1e-8
+                    # 加权求和后再对时间维取均值
+                    fused = (gw[:, 0:1, None] * main_self + gw[:, 1:2, None] * cross_a + gw[:, 2:3, None] * cross_v) / w_sum[:, None, :]
+                    fused_tokens[text_sel, 0, :] = fused.mean(dim=1)
+                else:
+                    fused_tokens[text_sel, 0, :] = (main_self + cross_a + cross_v).mean(dim=1)
 
-        if gate_img is not None and img_vec is not None:
-            img_vec = img_vec * gate_img
-        if gate_aud is not None and aud_vec is not None:
-            aud_vec = aud_vec * gate_aud
+            aud_sel = (main_idx == 1)
+            if torch.any(aud_sel):
+                txt_sel = txt[aud_sel]
+                txt_mask_sel = txt_pad_mask[aud_sel] if txt_pad_mask is not None else None
+                aud_main = auds[aud_sel]
+                img_sel = imgs[aud_sel]
 
-        alpha_img = 1
-        alpha_aud = 1
+                if txt_mask_sel is not None and txt_mask_sel.size(1) != txt_sel.size(1):
+                    txt_mask_sel = txt_mask_sel[:, :txt_sel.size(1)]
 
-        # 只有在有 input_ids 的情况下用占位符定位（generation 用 inputs_embeds 也能跑）
-        if input_ids is not None:
-            if img_vec is not None and img_id is not None and img_id >= 0:
-                # 找到每个样本中 <img> 的位置（只用第一个位置；若你允许多次出现可 for 循环）
-                img_mask = (input_ids == img_id)  # (B, L)
-                if img_mask.any():
-                    idx_b, idx_t = img_mask.nonzero(as_tuple=True)
-                    # 只取每个 b 的第一个位置
-                    # 如果你保证只出现一次，也可以直接 scatter_add
-                    # 这里简单做：按 batch 聚合第一个 idx
-                    first_pos = {}
-                    for b, t in zip(idx_b.tolist(), idx_t.tolist()):
-                        if b not in first_pos:
-                            first_pos[b] = t
-                    for b, t in first_pos.items():
-                        inputs_embeds[b, t, :] = inputs_embeds[b, t, :] + alpha_img * img_vec[b]
+                main_self, _ = self.mha_self(aud_main, aud_main, aud_main, key_padding_mask=aud_kmask[aud_sel])
+                cross_txt, _ = self.mha_cross(aud_main, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
+                cross_img, _ = self.mha_cross(aud_main, img_sel, img_sel, key_padding_mask=img_kmask[aud_sel])
 
-            if aud_vec is not None and aud_id is not None and aud_id >= 0:
-                aud_mask = (input_ids == aud_id)
-                if aud_mask.any():
-                    idx_b, idx_t = aud_mask.nonzero(as_tuple=True)
-                    first_pos = {}
-                    for b, t in zip(idx_b.tolist(), idx_t.tolist()):
-                        if b not in first_pos:
-                            first_pos[b] = t
-                    for b, t in first_pos.items():
-                        inputs_embeds[b, t, :] = inputs_embeds[b, t, :] + alpha_aud * aud_vec[b]
-        # -----------------------------------------------
+                if gate_w is not None:
+                    gw = gate_w[aud_sel]  # (B_sel,3)
+                    w_sum = gw.sum(dim=-1, keepdim=True) + 1e-8
+                    fused = (gw[:, 1:2, None] * main_self + gw[:, 0:1, None] * cross_txt + gw[:, 2:3, None] * cross_img) / w_sum[:, None, :]
+                    fused_tokens[aud_sel, 0, :] = fused.mean(dim=1)
+                else:
+                    fused_tokens[aud_sel, 0, :] = (main_self + cross_txt + cross_img).mean(dim=1)
+
+            vid_sel = (main_idx == 2)
+            if torch.any(vid_sel):
+                txt_sel = txt[vid_sel]
+                txt_mask_sel = txt_pad_mask[vid_sel] if txt_pad_mask is not None else None
+                aud_sel_v = auds[vid_sel]
+                img_main = imgs[vid_sel]
+
+                if txt_mask_sel is not None and txt_mask_sel.size(1) != txt_sel.size(1):
+                    txt_mask_sel = txt_mask_sel[:, :txt_sel.size(1)]
+
+                main_self, _ = self.mha_self(img_main, img_main, img_main, key_padding_mask=img_kmask[vid_sel])
+                cross_txt, _ = self.mha_cross(img_main, txt_sel, txt_sel, key_padding_mask=txt_mask_sel)
+                cross_aud, _ = self.mha_cross(img_main, aud_sel_v, aud_sel_v, key_padding_mask=aud_kmask[vid_sel])
+
+                if gate_w is not None:
+                    gw = gate_w[vid_sel]  # (B_sel,3)
+                    w_sum = gw.sum(dim=-1, keepdim=True) + 1e-8
+                    fused = (gw[:, 2:3, None] * main_self + gw[:, 0:1, None] * cross_txt + gw[:, 1:2, None] * cross_aud) / w_sum[:, None, :]
+                    fused_tokens[vid_sel, 0, :] = fused.mean(dim=1)
+                else:
+                    fused_tokens[vid_sel, 0, :] = (main_self + cross_txt + cross_aud).mean(dim=1)
+
+            # 将伪 token 拼到序列最前面
+            inputs_embeds = torch.cat([fused_tokens, inputs_embeds], dim=1)
+
+            # 同步 pad mask、token_type_ids，先补长度，再统一截断到 max_position_embeddings
+            if attn_mask_raw is not None:
+                attn_mask_raw = torch.cat(
+                    [torch.ones(B, 1, device=device, dtype=attn_mask_raw.dtype), attn_mask_raw.view(B, -1)], dim=1
+                )
+            else:
+                attn_mask_raw = torch.ones(B, inputs_embeds.size(1), device=device)
+
+            if token_type_ids is not None:
+                token_type_ids = torch.cat(
+                    [torch.zeros(B, 1, device=device, dtype=token_type_ids.dtype), token_type_ids.view(B, -1)], dim=1
+                )
+
+            max_pos = self.config.max_position_embeddings
+            if inputs_embeds.size(1) > max_pos:
+                inputs_embeds = inputs_embeds[:, -max_pos:, :]
+                attn_mask_raw = attn_mask_raw[:, -max_pos:]
+                if token_type_ids is not None:
+                    token_type_ids = token_type_ids[:, -max_pos:]
+
+            input_shape = inputs_embeds.size()[:-1]
+
+            # 对齐 mask 长度到当前序列长度
+            if attn_mask_raw is not None and attn_mask_raw.size(1) != input_shape[-1]:
+                diff = input_shape[-1] - attn_mask_raw.size(1)
+                if diff > 0:
+                    pad = torch.ones(B, diff, device=device, dtype=attn_mask_raw.dtype)
+                    attn_mask_raw = torch.cat([pad, attn_mask_raw], dim=1)
+                elif diff < 0:
+                    attn_mask_raw = attn_mask_raw[:, -input_shape[-1]:]
+            elif attn_mask_raw is None:
+                attn_mask_raw = torch.ones(B, input_shape[-1], device=device)
+
+            position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+
+        # 由新的 attn_mask_raw 重建 float attention_mask
+        if attn_mask_raw is not None:
+            # attn_mask_raw 现为 (B, L)
+            attention_mask = attn_mask_raw.view(batch_size, -1)
+            attention_mask = attention_mask[:, None, None, :]
+            attention_mask = attention_mask.to(dtype=self.dtype)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
 
         position_embeds = self.wpe(position_ids)
         hidden_states = inputs_embeds + position_embeds
@@ -572,9 +647,10 @@ class GPT2Model(GPT2PreTrainedModel):
 
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
-        all_cross_attentions = None
+        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+            encoder_hidden_states = caption_embeds
             if self.model_parallel:
                 torch.cuda.set_device(hidden_states.device)
                 # Ensure layer_past is on same device as hidden_states (might not be correct)
@@ -602,6 +678,8 @@ class GPT2Model(GPT2PreTrainedModel):
                     None,
                     attention_mask,
                     head_mask[i],
+                    encoder_hidden_states,
+                    encoder_attention_mask,
                 )
             else:
                 outputs = block(
@@ -609,6 +687,8 @@ class GPT2Model(GPT2PreTrainedModel):
                     layer_past=layer_past,
                     attention_mask=attention_mask,
                     head_mask=head_mask[i] if head_mask is not None else None,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
@@ -619,6 +699,8 @@ class GPT2Model(GPT2PreTrainedModel):
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
+                if self.config.add_cross_attention:
+                    all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
 
             if self.model_parallel:
                 for k, v in self.device_map.items():
@@ -633,15 +715,16 @@ class GPT2Model(GPT2PreTrainedModel):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, presents, all_hidden_states, all_self_attentions]
+                for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
                 if v is not None
             )
 
-        return BaseModelOutputWithPast(
+        return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=presents,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
+            cross_attentions=all_cross_attentions,
         )
 
 
@@ -668,6 +751,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         token_type_ids = kwargs.get("token_type_ids", None)
+        main_idx = kwargs.get("main_idx", None)
+        imgs = kwargs.get("imgs", None)
+        auds = kwargs.get("auds", None)
         if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
             if token_type_ids is not None:
@@ -696,27 +782,34 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
                 "token_type_ids": token_type_ids,
+                "main_idx": main_idx,
+                "imgs": imgs,
+                "auds": auds,
             }
         )
         return model_inputs
 
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        emotion_labels: Optional[torch.LongTensor] = None, # <-- NEW: Add emotion_labels parameter
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        imgs=None, auds=None,
-    ) -> Union[Tuple, CausalLMOutputWithEmotionClassification]: # <-- MODIFIED: Return new output class
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            token_type_ids: Optional[torch.LongTensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            emotion_labels: Optional[torch.LongTensor] = None,  # <-- NEW: Add emotion_labels parameter
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            main_idx: Optional[torch.Tensor] = None,
+            imgs=None, auds=None, caption_ids: Optional[torch.LongTensor] = None,
+            gated_weights = None,
+    ) -> Union[Tuple, CausalLMOutputWithEmotionClassification]:  # <-- MODIFIED: Return new output class
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -728,12 +821,15 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            imgs=imgs,
-            auds=auds,
+            main_idx=main_idx,
+            imgs=imgs, auds=auds, caption_ids=caption_ids,
+            gated_weights=gated_weights,
         )
         hidden_states = transformer_outputs[0]
 
@@ -744,46 +840,31 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         lm_logits = self.lm_head(hidden_states)
 
         last_token_hidden_state = hidden_states[:, -1, :]
-        emotion_logits = self.emotion_head(last_token_hidden_state)
 
         loss = None
-        if labels is not None and emotion_labels is not None:
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct_lm = CrossEntropyLoss()
-            loss_lm = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-            loss_fct_emotion = CrossEntropyLoss()
-            loss_emotion = loss_fct_emotion(emotion_logits.view(-1, self.num_emotions), emotion_labels.view(-1))
-
-            loss = loss_lm + loss_emotion
-        elif labels is not None:
+        if labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        elif emotion_labels is not None:
-            loss_fct_emotion = CrossEntropyLoss()
-            loss = loss_fct_emotion(emotion_logits.view(-1, self.num_emotions), emotion_labels.view(-1))
-
 
         if not return_dict:
             # Add emotion_logits to the tuple output
-            output = (lm_logits, emotion_logits) + transformer_outputs[1:]
+            output = lm_logits + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithEmotionClassification(
             loss=loss,
             logits=lm_logits,
-            emotion_logits=emotion_logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
+            cross_attentions=transformer_outputs.cross_attentions,
         )
 
     @staticmethod
     def _reorder_cache(
-        past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
+            past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
     ) -> Tuple[Tuple[torch.Tensor]]:
         return tuple(
             tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)

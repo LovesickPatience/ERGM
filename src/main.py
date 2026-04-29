@@ -356,8 +356,7 @@ class Manager:
                     mix_w = None
 
                 outputs = self.model(
-                    input_ids=input_ids, token_type_ids=token_type_ids,
-                    labels=lm_labels, emotion_labels=emotion_labels,
+                    input_ids=input_ids, token_type_ids=token_type_ids, labels=lm_labels,
                     imgs=imgs,
                     auds=auds,
                 )
@@ -377,22 +376,16 @@ class Manager:
                     lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                     train_lm_losses.append(lm_loss.item())
 
-                    preds = torch.argmax(outputs.emotion_logits, dim=-1)
-                    train_correct_emotions += (preds == emotion_labels).sum().item()
-                    train_total_emotions += emotion_labels.size(0)
-
             avg_train_loss = np.mean(train_total_losses)
             avg_lm_loss = np.mean(train_lm_losses)
             train_ppl = math.exp(avg_lm_loss)
-            train_acc = (train_correct_emotions / train_total_emotions) * 100
 
             print(f"Train Loss: {avg_train_loss:.4f} | Train PPL: {train_ppl:.4f} | Train Emotion Acc: {train_acc:.2f}%")
             self.writer.add_scalar("Loss/train", avg_train_loss, epoch)
             self.writer.add_scalar("PPL/train", train_ppl, epoch)
-            self.writer.add_scalar("Accuracy/train", train_acc, epoch)
 
             self.last_epoch += 1
-            valid_loss, valid_ppl, valid_acc = self.validation()
+            valid_loss, valid_ppl = self.validation()
 
             if valid_ppl < self.best_ppl:
                 self.best_ppl = valid_ppl
@@ -403,16 +396,15 @@ class Manager:
                     "ppl": self.best_ppl,
                     "epoch": self.last_epoch,
                 }
-                save_path = os.path.join(self.args.ckpt_dir, f"best_ckpt_epoch={epoch}_valid_ppl={self.best_ppl:.4f}_val_emo_acc={valid_acc:.2f}%_text+imgs+auds.ckpt")
+                save_path = os.path.join(self.args.ckpt_dir, f"best_ckpt_epoch={epoch}_valid_ppl={self.best_ppl:.4f}_text+imgs+auds.ckpt")
                 torch.save(state_dict, save_path)
                 print("*" * 10 + " Current best checkpoint is saved. " + "*" * 10)
                 print(save_path)
 
             print(f"Best valid PPL: {self.best_ppl:.4f}")
-            print(f"Current valid loss: {valid_loss:.4f} | Current valid PPL: {valid_ppl:.4f} | Current valid Emotion Acc: {valid_acc:.2f}%")
+            print(f"Current valid loss: {valid_loss:.4f} | Current valid PPL: {valid_ppl:.4f} |")
             self.writer.add_scalar("Loss/valid", valid_loss, epoch)
             self.writer.add_scalar("PPL/valid", valid_ppl, epoch)
-            self.writer.add_scalar("Accuracy/valid", valid_acc, epoch)
 
         print("Training finished!")
 
@@ -422,8 +414,6 @@ class Manager:
 
         valid_total_losses = []
         valid_lm_losses = []
-        valid_correct_emotions = 0
-        valid_total_emotions = 0
 
         with torch.no_grad():
             for i, batch in enumerate(tqdm(self.valid_loader)):
@@ -445,7 +435,6 @@ class Manager:
 
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
-                    labels=lm_labels, emotion_labels=emotion_labels,
                     imgs=imgs,
                     auds=auds
                 )
@@ -458,19 +447,14 @@ class Manager:
                 lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 valid_lm_losses.append(lm_loss.item())
 
-                preds = torch.argmax(outputs.emotion_logits, dim=-1)
-                valid_correct_emotions += (preds == emotion_labels).sum().item()
-                valid_total_emotions += emotion_labels.size(0)
-
         avg_valid_loss = np.mean(valid_total_losses)
         avg_lm_loss = np.mean(valid_lm_losses)
         valid_ppl = math.exp(avg_lm_loss)
-        valid_acc = (valid_correct_emotions / valid_total_emotions) * 100
 
         if math.isnan(valid_ppl):
             valid_ppl = 1e8
 
-        return avg_valid_loss, valid_ppl, valid_acc
+        return avg_valid_loss, valid_ppl
 
     def nucleus_sampling(self, input_ids, token_type_ids, input_len):
         output_ids = []
@@ -713,6 +697,8 @@ class Manager:
         all_references = []
         all_true_labels = []
         all_losses = [] # For overall test PPL
+        test_correct_emotions = 0
+        test_total_emotions = 0
 
         with torch.no_grad():
             if self.args.choose_use_test_or_val == 'val':
@@ -744,6 +730,7 @@ class Manager:
 
                     output_ids = self.nucleus_sampling(current_input[:, :input_len], current_token_types[:, :input_len], input_len)
                     hypothesis_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                    print("hyp: ", hypothesis_text)
                     all_hypotheses.append(hypothesis_text)
 
                     ref_ids = lm_labels[i][lm_labels[i] != -100] # Filter out padding
@@ -752,14 +739,18 @@ class Manager:
                     
                     all_true_labels.append(emotion_labels[i].item())
 
-                outputs = self.model(input_ids=input_ids, token_type_ids=token_type_ids, labels=lm_labels)
+                outputs = self.model(input_ids=input_ids, token_type_ids=token_type_ids, labels=lm_labels, emotion_labels=emotion_labels)
+                preds = torch.argmax(outputs.emotion_logits, dim=-1)
+                test_correct_emotions += (preds == emotion_labels).sum().item()
+                test_total_emotions += emotion_labels.size(0)
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
                 shift_labels = lm_labels[..., 1:].contiguous()
                 loss_fct_lm = nn.CrossEntropyLoss()
                 lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 all_losses.append(lm_loss.item())
 
-        return all_hypotheses, all_references, all_true_labels, all_losses
+        test_acc = (test_correct_emotions / test_total_emotions) * 100 if test_total_emotions > 0 else 0.0
+        return all_hypotheses, all_references, all_true_labels, all_losses, test_acc
 
 
 if __name__ == "__main__":
@@ -818,13 +809,18 @@ if __name__ == "__main__":
         assert args.ckpt_name is not None, "Please specify the trained model checkpoint using --ckpt_name."
         manager = Manager(args)
 
+        if args.dataset == "IEMOCAP":
+            baseline_path = "/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large.tsv"
+        elif args.dataset == "MELD":
+            baseline_path = "/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large-meld.tsv"
+
         evaluator = Evaluator(device=manager.args.device,
                               bert_model_path='/root/autodl-tmp/ERGM-main/tools/models/roberta-large',
-                              baseline_path="/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large.tsv",
+                              baseline_path=baseline_path,
                               num_layers=24,
-                              rescale_with_baseline=True, )
+                              rescale_with_baseline=False, )
         
-        hypotheses, references, true_labels, losses = manager.test()
+        hypotheses, references, true_labels, losses, test_acc = manager.test()
         infer_dump_path = os.path.join(args.output_dir, args.dataset.lower(), f"{args.ckpt_name}_infer_outputs.pkl")
         os.makedirs(os.path.dirname(infer_dump_path), exist_ok=True)
         with open(infer_dump_path, "wb") as f:
@@ -834,6 +830,7 @@ if __name__ == "__main__":
                     "references": references,
                     "true_labels": true_labels,
                     "losses": losses,
+                    "test_acc": test_acc,
                 },
                 f,
             )
@@ -843,6 +840,12 @@ if __name__ == "__main__":
             hypotheses=hypotheses,
             references=references
         )
+
+        test_avg_losses = np.mean(losses)
+        test_ppl = math.exp(test_avg_losses)
+
+        print(f"PPL: {test_ppl:.4f}")
+        print(f"Emotion Acc: {test_acc:.2f}%")
 
         print("\n--- Final Evaluation Results ---")
         for metric, value in final_metrics.items():

@@ -178,6 +178,10 @@ class PadCollate():
             aud_tok = getattr(self.args, 'aud_token', '<aud>')
             img_tid = _tok_id(img_tok)
             aud_tid = _tok_id(aud_tok)
+            if img_tid is None:
+                img_tid = getattr(self.args, "img_token_id", None)
+            if aud_tid is None:
+                aud_tid = getattr(self.args, "aud_token_id", None)
 
             def _stack_1d(x):
                 # x: (T,D) or (D,) -> (D,) float32; if (T,D), mean-pool on T
@@ -659,6 +663,10 @@ class PadCollate():
                     aud_tid = tokenizer.convert_tokens_to_ids(aud_tok)
                 except Exception:
                     aud_tid = None
+                if img_tid is None:
+                    img_tid = getattr(self.args, "img_token_id", None)
+                if aud_tid is None:
+                    aud_tid = getattr(self.args, "aud_token_id", None)
 
             # emotion map for MELD (7 classes)
             _EMO_MAP = getattr(self.args, 'emo_map', None)

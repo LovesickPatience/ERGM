@@ -15,7 +15,7 @@ from transformers import (
     get_polynomial_decay_schedule_with_warmup,
 )
 
-from src.model.model_with_fusion import *
+from src.model.wo_eh import *
 from src.custom_dataset import *
 from eval.evaluate import Evaluator
 from selector.selector_models import SelectorConfig, build_selector
@@ -337,7 +337,7 @@ class Manager:
                     lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                     train_lm_losses.append(lm_loss.item())
 
-                    preds = torch.argmax(outputs.emotion_logits, dim=-1)
+                    preds = torch.argmax(outputs.logits, dim=-1)
                     train_correct_emotions += (preds == emotion_labels).sum().item()
                     train_total_emotions += emotion_labels.size(0)
 
@@ -424,7 +424,7 @@ class Manager:
                 lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 valid_lm_losses.append(lm_loss.item())
 
-                preds = torch.argmax(outputs.emotion_logits, dim=-1)
+                preds = torch.argmax(outputs.logits, dim=-1)
                 valid_correct_emotions += (preds == emotion_labels).sum().item()
                 valid_total_emotions += emotion_labels.size(0)
 
@@ -631,7 +631,7 @@ class Manager:
 
         cfg = SelectorConfig(
             input_dim=input_dim,
-            hidden_dim=input_dim,
+            hidden_dim=self.args.selector_hidden_dim,
             num_layers=self.args.selector_num_layers,
             dropout=self.args.selector_dropout,
             mode="continuous",
@@ -719,7 +719,6 @@ class Manager:
                     output_ids = self.nucleus_sampling(current_input[:, :input_len], current_token_types[:, :input_len],
                                                        input_len)
                     hypothesis_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-                    print("hyp: ", hypothesis_text)
                     all_hypotheses.append(hypothesis_text)
 
                     ref_ids = lm_labels[i][lm_labels[i] != -100]  # Filter out padding

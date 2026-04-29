@@ -129,75 +129,109 @@ class Manager:
             ppd = PadCollate(eos_id=self.args.eos_id, args=self.args)
             if getattr(self.args, 'dataset', 'ERGM') == 'IEMOCAP':
                 # IEMOCAP: audio/video from PKL, text from JSON; encode in collate
-                assert self.args.train_pkls and self.args.val_pkls and self.args.iemocap_text_json, \
-                    "For IEMOCAP, please set --train_pkls, --val_pkls and --iemocap_text_json"
+                if args.mode == 'train':
+                    assert self.args.train_pkls and self.args.val_pkls and self.args.iemocap_text_json, \
+                        "For IEMOCAP, please set --train_pkls, --val_pkls and --iemocap_text_json"
 
-                # Support comma-separated multiple PKLs
-                train_pkl_list = [p.strip() for p in self.args.train_pkls.split(',')] \
-                    if isinstance(self.args.train_pkls, str) else self.args.train_pkls
-                val_pkl_list = [p.strip() for p in self.args.val_pkls.split(',')] \
-                    if isinstance(self.args.val_pkls, str) else self.args.val_pkls
-                test_pkl_list = [p.strip() for p in self.args.val_pkls.split(',')] \
-                    if isinstance(self.args.val_pkls, str) else self.args.val_pkls
+                if args.mode == 'train':
+                    # Support comma-separated multiple PKLs
+                    train_pkl_list = [p.strip() for p in self.args.train_pkls.split(',')] \
+                        if isinstance(self.args.train_pkls, str) else self.args.train_pkls
+                    val_pkl_list = [p.strip() for p in self.args.val_pkls.split(',')] \
+                        if isinstance(self.args.val_pkls, str) else self.args.val_pkls
 
-                train_set = IEMOCAPDialoguePKLDataset(
-                    pkl_path=train_pkl_list[0],
-                    json_path=self.args.iemocap_text_json,
-                    split='train',
-                    bos=None,
-                    eos=self.args.eos_token,
-                )
-                valid_set = IEMOCAPDialoguePKLDataset(
-                    pkl_path=val_pkl_list[0],
-                    json_path=self.args.iemocap_text_json,
-                    split='val',
-                    bos=None,
-                    eos=self.args.eos_token,
-                )
-                test_set = IEMOCAPDialoguePKLDataset(pkl_path=train_pkl_list[0], json_path=self.args.iemocap_text_json,
-                                                     split='test')
+                    train_set = IEMOCAPDialoguePKLDataset(pkl_path=train_pkl_list[0],
+                                                          json_path=self.args.iemocap_text_json, split='train')
+                    valid_set = IEMOCAPDialoguePKLDataset(pkl_path=val_pkl_list[0],
+                                                          json_path=self.args.iemocap_text_json, split='val')
+                elif args.mode == 'infer':
+                    val_pkl_list = [p.strip() for p in self.args.val_pkls.split(',')] \
+                        if isinstance(self.args.val_pkls, str) else self.args.val_pkls
+                    test_pkl_list = [p.strip() for p in self.args.val_pkls.split(',')] \
+                        if isinstance(self.args.val_pkls, str) else self.args.val_pkls
 
-                collate = ppd.iemocap_collate_without_prefix(self.tokenizer)
-                self.train_loader = DataLoader(
-                    train_set, collate_fn=collate, shuffle=True,
-                    batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
-                )
-                self.valid_loader = DataLoader(
-                    valid_set, collate_fn=collate, shuffle=False,
-                    batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
-                )
-                self.test_loader = DataLoader(
-                    test_set, collate_fn=collate, shuffle=False,
-                    batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
-                )
+                    valid_set = IEMOCAPDialoguePKLDataset(pkl_path=val_pkl_list[0],
+                                                          json_path=self.args.iemocap_text_json, split='val')
+                    test_set = IEMOCAPDialoguePKLDataset(pkl_path=test_pkl_list[0],
+                                                         json_path=self.args.iemocap_text_json, split='test')
+
+                collate = ppd.iemocap_collate(self.tokenizer)
+                if args.mode == 'train':
+                    self.train_loader = DataLoader(
+                        train_set, collate_fn=collate, shuffle=True,
+                        batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                    )
+                    self.valid_loader = DataLoader(
+                        valid_set, collate_fn=collate, shuffle=False,
+                        batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                    )
+                elif args.mode == 'infer':
+                    self.valid_loader = DataLoader(
+                        valid_set, collate_fn=collate, shuffle=False,
+                        batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                    )
+                    self.test_loader = DataLoader(
+                        test_set, collate_fn=collate, shuffle=False,
+                        batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                    )
             elif getattr(self.args, 'dataset', 'ERGM') == 'MELD':
-                assert self.args.meld_text_json and self.args.meld_aud_pkl and self.args.meld_img_pkl, \
-                    "For MELD, please set --meld_text_json, --meld_aud_pkl, --meld_img_pkl"
-                train_set = MELDDialoguePKLDataset(
-                    json_path=self.args.meld_text_json,
-                    audio_pkl=self.args.meld_aud_pkl,
-                    video_pkl=self.args.meld_img_pkl,
-                    split="train",
-                    bos=None,
-                    eos=self.args.eos_token,
-                )
-                valid_set = MELDDialoguePKLDataset(
-                    json_path=self.args.meld_text_json_val,
-                    audio_pkl=self.args.meld_aud_pkl,
-                    video_pkl=self.args.meld_img_pkl,
-                    split="val",
-                    bos=None,
-                    eos=self.args.eos_token,
-                )
+                if args.mode == 'train':
+                    assert self.args.meld_text_json and self.args.meld_aud_pkl and self.args.meld_img_pkl, \
+                        "For MELD, please set --meld_text_json, --meld_aud_pkl, --meld_img_pkl"
+                if args.mode == 'train':
+                    train_set = MELDDialoguePKLDataset(
+                        json_path=self.args.meld_text_json,
+                        audio_pkl=self.args.meld_aud_pkl,
+                        video_pkl=self.args.meld_img_pkl,
+                        split="train",
+                        bos=None,
+                        eos=self.args.eos_token,
+                    )
+                    valid_set = MELDDialoguePKLDataset(
+                        json_path=self.args.meld_text_json_val,
+                        audio_pkl=self.args.meld_aud_pkl,
+                        video_pkl=self.args.meld_img_pkl,
+                        split="val",
+                        bos=None,
+                        eos=self.args.eos_token,
+                    )
+                elif args.mode == 'infer':
+                    valid_set = MELDDialoguePKLDataset(
+                        json_path=self.args.meld_text_json_val,
+                        audio_pkl=self.args.meld_aud_pkl,
+                        video_pkl=self.args.meld_img_pkl,
+                        split="val",
+                        bos=None,
+                        eos=self.args.eos_token,
+                    )
+                    test_set = MELDDialoguePKLDataset(
+                        json_path=self.args.meld_text_json_test,
+                        audio_pkl=self.args.meld_aud_pkl_test,
+                        video_pkl=self.args.meld_img_pkl_test,
+                        split="test",
+                        bos=None,
+                        eos=self.args.eos_token,
+                    )
+
                 collate = ppd.meld_collate_without_prefix(self.tokenizer)
-                self.train_loader = DataLoader(
-                    train_set, collate_fn=collate, shuffle=True,
-                    batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
-                )
-                self.valid_loader = DataLoader(
-                    valid_set, collate_fn=collate, shuffle=False,
-                    batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
-                )
+                if args.mode == 'train':
+                    self.train_loader = DataLoader(
+                        train_set, collate_fn=collate, shuffle=True,
+                        batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                    )
+                    self.valid_loader = DataLoader(
+                        valid_set, collate_fn=collate, shuffle=False,
+                        batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                    )
+                elif args.mode == 'infer':
+                    self.valid_loader = DataLoader(
+                        valid_set, collate_fn=collate, shuffle=False,
+                        batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                    )
+                    self.test_loader = DataLoader(
+                        test_set, collate_fn=collate, shuffle=False,
+                        batch_size=self.args.batch_size, num_workers=self.args.num_workers, pin_memory=True,
+                    )
             else:
                 # Default ERGM baseline path: use original CustomDataset & PadCollate
                 train_set = CustomDataset(self.args.train_prefix, self.args)
@@ -220,13 +254,14 @@ class Manager:
             params = list(self.model.parameters()) + list(self.selector.parameters())
             self.optim = torch.optim.AdamW(params, lr=self.args.lr)
 
-            num_batches = len(self.train_loader)
-            args.total_train_steps = args.num_epochs * num_batches
-            args.warmup_steps = int(args.warmup_ratio * args.total_train_steps)
+            if args.mode == 'train':
+                num_batches = len(self.train_loader)
+                args.total_train_steps = args.num_epochs * num_batches
+                args.warmup_steps = int(args.warmup_ratio * args.total_train_steps)
 
-            self.sched = get_polynomial_decay_schedule_with_warmup(
-                self.optim, num_warmup_steps=args.warmup_steps, num_training_steps=args.total_train_steps, power=2,
-            )
+                self.sched = get_polynomial_decay_schedule_with_warmup(
+                    self.optim, num_warmup_steps=args.warmup_steps, num_training_steps=args.total_train_steps, power=2,
+                )
             self.writer = SummaryWriter()
 
         if self.args.ckpt_name is not None:
@@ -362,7 +397,7 @@ class Manager:
                     self.args.ckpt_dir,
                     f"best_ckpt_epoch={epoch}_valid_ppl={self.best_ppl:.4f}_val_emo_acc={valid_acc:.2f}%_{now}+selector.ckpt",
                 )
-                if epoch == 2:
+                if epoch % 2 == 0:
                     torch.save(state_dict, save_path)
                 print("*" * 10 + " Current best checkpoint is saved. " + "*" * 10)
                 print(save_path)
@@ -447,7 +482,7 @@ class Manager:
             sorted_probs[idx_remove] = 0.0
             sorted_probs /= torch.sum(sorted_probs, dim=-1, keepdim=True)
 
-            probs = torch.zeros(probs.shape, device=self.args.device).scatter_(-1, sorted_idxs, sorted_probs)
+            probs = torch.zeros(probs.shape, device=self.args.device, dtype=sorted_probs.dtype).scatter_(-1, sorted_idxs, sorted_probs)
             idx = torch.multinomial(probs, 1)
             idx_item = idx.squeeze(-1).squeeze(-1).item()
             output_ids.append(idx_item)
@@ -685,9 +720,15 @@ class Manager:
         all_references = []
         all_true_labels = []
         all_losses = []  # For overall test PPL
+        test_correct_emotions = 0
+        test_total_emotions = 0
 
         with torch.no_grad():
-            for _, batch in enumerate(tqdm(self.valid_loader)):
+            if self.args.choose_use_test_or_val == 'val':
+                data_loader = self.valid_loader
+            elif self.args.choose_use_test_or_val == 'test':
+                data_loader = self.test_loader
+            for _, batch in enumerate(tqdm(data_loader)):
                 input_ids, token_type_ids, lm_labels, imgs, auds, contexts, emotion_labels = batch
 
                 input_ids, token_type_ids, lm_labels, emotion_labels = (
@@ -725,13 +766,18 @@ class Manager:
                     gated_weights=gate,
                     main_idx=main_idx,
                 )
+                preds = torch.argmax(outputs.emotion_logits, dim=-1)
+                test_correct_emotions += (preds == emotion_labels).sum().item()
+                test_total_emotions += emotion_labels.size(0)
+
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
                 shift_labels = lm_labels[..., 1:].contiguous()
                 loss_fct_lm = nn.CrossEntropyLoss()
                 lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 all_losses.append(lm_loss.item())
 
-        return all_hypotheses, all_references, all_true_labels, all_losses
+        test_acc = (test_correct_emotions / test_total_emotions) * 100 if test_total_emotions > 0 else 0.0
+        return all_hypotheses, all_references, all_true_labels, all_losses, test_acc
 
 
 if __name__ == "__main__":
@@ -779,10 +825,18 @@ if __name__ == "__main__":
                         help="(MELD) path to meld_diadict.json")
     parser.add_argument("--meld_text_json_val", type=str, default=None,
                         help="(MELD) path to meld_diadict_val.json")
+    parser.add_argument("--meld_text_json_test", type=str, default=None,
+                        help="(MELD) path to meld_diadict_test.json")
     parser.add_argument("--meld_aud_pkl", type=str, default=None,
                         help="(MELD) path to audio features PKL with keys {'0','1'}")
     parser.add_argument("--meld_img_pkl", type=str, default=None,
                         help="(MELD) path to image/video features PKL with keys {'0','1'}")
+    parser.add_argument("--meld_aud_pkl_test", type=str, default=None,
+                        help="(MELD) path to audio features PKL with keys {'0','1'}")
+    parser.add_argument("--meld_img_pkl_test", type=str, default=None,
+                        help="(MELD) path to image/video features PKL with keys {'0','1'}")
+    parser.add_argument("--choose_use_test_or_val", type=str, default='val', choices=["val", "test"],
+                        help="Choose use which dataset split to infer.")
     # LoRA
     parser.add_argument("--use_lora", action="store_true", help="Enable LoRA fine-tuning to reduce memory.")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
@@ -794,8 +848,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     model_name = args.model_type.split("/")[-1]
-    args.data_dir = os.path.join(args.data_dir, model_name)
-    args.ckpt_dir = os.path.join(args.ckpt_dir, model_name)
+    args.data_dir = os.path.join(args.data_dir, model_name, args.dataset.lower())
+    args.ckpt_dir = os.path.join(args.ckpt_dir, model_name, args.dataset.lower())
 
     if args.mode == 'train':
         manager = Manager(args)
@@ -804,18 +858,42 @@ if __name__ == "__main__":
         assert args.ckpt_name is not None, "Please specify the trained model checkpoint using --ckpt_name."
         manager = Manager(args)
 
-        hypotheses, references, true_labels, losses = manager.test()
+        if args.dataset == "IEMOCAP":
+            baseline_path = "/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large.tsv"
+        elif args.dataset == "MELD":
+            baseline_path = "/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large-meld.tsv"
 
         evaluator = Evaluator(device=manager.args.device,
                               bert_model_path='/root/autodl-tmp/ERGM-main/tools/models/roberta-large',
-                              baseline_path="/root/autodl-tmp/ERGM-main/tools/models/roberta-large/roberta-large.tsv",
+                              baseline_path=baseline_path,
                               num_layers=24,
-                              rescale_with_baseline=True,)
+                              rescale_with_baseline=False, )
+
+        hypotheses, references, true_labels, losses, test_acc = manager.test()
+        infer_dump_path = os.path.join(args.output_dir, args.dataset.lower(), f"{args.ckpt_name}_infer_outputs.pkl")
+        os.makedirs(os.path.dirname(infer_dump_path), exist_ok=True)
+        with open(infer_dump_path, "wb") as f:
+            pickle.dump(
+                {
+                    "hypotheses": hypotheses,
+                    "references": references,
+                    "true_labels": true_labels,
+                    "losses": losses,
+                    "test_acc": test_acc,
+                },
+                f,
+            )
 
         final_metrics = evaluator.evaluate_all(
             hypotheses=hypotheses,
             references=references
         )
+
+        test_avg_losses = np.mean(losses)
+        test_ppl = math.exp(test_avg_losses)
+
+        print(f"PPL: {test_ppl:.4f}")
+        print(f"Emotion Acc: {test_acc:.2f}%")
 
         print("\n--- Final Evaluation Results ---")
         for metric, value in final_metrics.items():

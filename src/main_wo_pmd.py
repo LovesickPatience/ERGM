@@ -15,7 +15,7 @@ from transformers import (
     get_polynomial_decay_schedule_with_warmup,
 )
 
-from src.model.model_with_fusion import *
+from src.model.wo_pmd import *
 from src.custom_dataset import *
 from eval.evaluate import Evaluator
 from selector.selector_models import SelectorConfig, build_selector
@@ -311,7 +311,7 @@ class Manager:
                     torch.LongTensor(emotion_labels).to(self.args.device),  # Ensure emotion labels are tensors
                 )
 
-                gated_weight, main_idx = self._selector_forward(input_ids, imgs, auds)
+                gated_weight, main_idx = None, None
 
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
@@ -370,7 +370,7 @@ class Manager:
                     self.args.ckpt_dir,
                     f"best_ckpt_epoch={epoch}_valid_ppl={self.best_ppl:.4f}_val_emo_acc={valid_acc:.2f}%_{now}_text+imgs+auds.ckpt",
                 )
-                torch.save(state_dict, save_path)
+                # torch.save(state_dict, save_path)
                 print("*" * 10 + " Current best checkpoint is saved. " + "*" * 10)
                 print(save_path)
 
@@ -405,7 +405,7 @@ class Manager:
                     torch.LongTensor(emotion_labels).to(self.args.device),
                 )
 
-                gate, main_idx = self._selector_forward(input_ids, imgs, auds)
+                gate, main_idx = None, None
 
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
@@ -631,7 +631,7 @@ class Manager:
 
         cfg = SelectorConfig(
             input_dim=input_dim,
-            hidden_dim=input_dim,
+            hidden_dim=self.args.selector_hidden_dim,
             num_layers=self.args.selector_num_layers,
             dropout=self.args.selector_dropout,
             mode="continuous",
@@ -719,7 +719,6 @@ class Manager:
                     output_ids = self.nucleus_sampling(current_input[:, :input_len], current_token_types[:, :input_len],
                                                        input_len)
                     hypothesis_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-                    print("hyp: ", hypothesis_text)
                     all_hypotheses.append(hypothesis_text)
 
                     ref_ids = lm_labels[i][lm_labels[i] != -100]  # Filter out padding
@@ -728,7 +727,7 @@ class Manager:
 
                     all_true_labels.append(emotion_labels[i].item())
 
-                gate, main_idx = self._selector_forward(input_ids, imgs, auds)
+                gate, main_idx = None, None
 
                 outputs = self.model(
                     input_ids=input_ids,
