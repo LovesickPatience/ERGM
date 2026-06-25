@@ -653,7 +653,8 @@ class Manager:
         states = _build_states(text_feat, aud_feat, vid_feat)  # (B, 3D)
 
         # 2) selector 选动作 -> 得到 (B,3) 权重
-        weights = _selector_pick_weights(self.selector, self.selector_action_table, states, self.args.selector_temperature)  # (B,3)
+        tau = getattr(self.args, 'tau', None) or self.args.selector_temperature
+        weights = _selector_pick_weights(self.selector, self.selector_action_table, states, tau)  # (B,3)
 
         # 3) 把权重编码为文本 tag 并前缀到每个样本（与 tokenizer 兼容，最小侵入）
         tags = []
@@ -822,6 +823,8 @@ if __name__ == "__main__":
     parser.add_argument("--selector_ckpt", type=str, default="checkpoints/selector/latest.pt", help="路径指向你训练好的 selector checkpoint（.pt）")
     parser.add_argument("--selector_device", type=str, default=None, help="selector 推理放到哪块设备；默认跟主模型一致")
     parser.add_argument("--selector_temperature", type=float, default=1.0, help="离散策略温度：>1更平；<1更尖锐；一般 1.0 即可")
+    parser.add_argument("--tau", type=float, default=None,
+                        help="推理时 MRD 温度缩放 τ（覆盖 selector_temperature）；不传则沿用 selector_temperature 默认值 1.0")
     parser.add_argument("--selector_enable", type=str, choices=["off", "val", "train_eval"], default="off",
                         help="off=不用selector；val=只在验证/测试用；train_eval=训练和验证都用")
     parser.add_argument("--dataset", type=str, default="ERGM", choices=["ERGM", "IEMOCAP", "MELD"], help="Choose data pipeline. IEMOCAP uses PKL+JSON via IEMOCAPDialoguePKLDataset. MELD uses JSON+separate A/V PKLs.")
