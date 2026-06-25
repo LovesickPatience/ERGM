@@ -15,12 +15,11 @@ TAUS=(0.1 0.5 1.0 2.0 5.0)
 
 for tau in "${TAUS[@]}"; do
     echo "===== τ=${tau} ====="
-    python src/main.py \
+    python -m src.main_with_selector \
         --mode infer \
         --dataset "${DATASET^^}" \
         --ckpt_dir "$CKPT_DIR" \
         --ckpt_name "$CKPT_NAME" \
-        --selector_enable val \
         --tau "$tau" \
         --output_dir "${OUTPUT_DIR}/tau_${tau}"
 done

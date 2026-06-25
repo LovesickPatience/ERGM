@@ -3,6 +3,7 @@ import argparse
 import os
 import pickle
 import time
+import json
 
 import random
 import numpy as np
@@ -676,7 +677,8 @@ class Manager:
         sel_out = self.selector(states)
         gate = sel_out.get("gate")
         if gate is None:
-            gate = torch.softmax(sel_out["logits"], dim=-1)
+            tau = getattr(self.args, 'tau', None) or 1.0
+            gate = torch.softmax(sel_out["logits"] / float(max(1e-6, tau)), dim=-1)
 
         main_idx = torch.argmax(gate, dim=-1)  # (B,)
         return gate, main_idx
@@ -694,6 +696,9 @@ class Manager:
         all_losses = []  # For overall test PPL
         test_correct_emotions = 0
         test_total_emotions = 0
+
+        save_alpha = bool(getattr(self.args, 'save_alpha_log', False))
+        alpha_records = []
 
         with torch.no_grad():
             if self.args.choose_use_test_or_val == 'val':
@@ -744,6 +749,23 @@ class Manager:
                 test_correct_emotions += (preds == emotion_labels).sum().item()
                 test_total_emotions += emotion_labels.size(0)
 
+                if save_alpha:
+                    B = input_ids.size(0)
+                    base = len(all_hypotheses) - B
+                    gate_cpu = gate.detach().float().cpu().tolist()
+                    main_cpu = main_idx.detach().cpu().tolist()
+                    pred_cpu = preds.detach().cpu().tolist()
+                    for i in range(B):
+                        alpha_records.append({
+                            "sample_id": base + i,
+                            "alpha": gate_cpu[i],
+                            "main_modal": int(main_cpu[i]),
+                            "pred_emo": int(pred_cpu[i]),
+                            "true_emo": int(emotion_labels[i].item()),
+                            "hypothesis": all_hypotheses[base + i] if base + i < len(all_hypotheses) else "",
+                            "reference": all_references[base + i] if base + i < len(all_references) else "",
+                        })
+
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
                 shift_labels = lm_labels[..., 1:].contiguous()
                 loss_fct_lm = nn.CrossEntropyLoss()
@@ -751,7 +773,7 @@ class Manager:
                 all_losses.append(lm_loss.item())
 
         test_acc = (test_correct_emotions / test_total_emotions) * 100 if test_total_emotions > 0 else 0.0
-        return all_hypotheses, all_references, all_true_labels, all_losses, test_acc
+        return all_hypotheses, all_references, all_true_labels, all_losses, test_acc, alpha_records
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -808,6 +830,10 @@ if __name__ == "__main__":
                         help="(MELD) path to audio features PKL with keys {'0','1'}")
     parser.add_argument("--meld_img_pkl_test", type=str, default=None,
                         help="(MELD) path to image/video features PKL with keys {'0','1'}")
+    parser.add_argument("--tau", type=float, default=None,
+                        help="推理时 MRD 温度缩放 τ；不传则默认 1.0（等价于原始行为）")
+    parser.add_argument("--save_alpha_log", action="store_true",
+                        help="推理时将每个样本的 RaMRA α (gate) 落盘到 alpha_log.jsonl（仅影响 infer）")
     parser.add_argument("--choose_use_test_or_val", type=str, default='val', choices=["val", "test"],
                         help="Choose use which dataset split to infer.")
 
@@ -835,9 +861,16 @@ if __name__ == "__main__":
                               num_layers=24,
                               rescale_with_baseline=False, )
 
-        hypotheses, references, true_labels, losses, test_acc = manager.test()
+        hypotheses, references, true_labels, losses, test_acc, alpha_records = manager.test()
         infer_dump_path = os.path.join(args.output_dir, args.dataset.lower(), f"{args.ckpt_name}_infer_outputs.pkl")
         os.makedirs(os.path.dirname(infer_dump_path), exist_ok=True)
+
+        if args.save_alpha_log and len(alpha_records) > 0:
+            alpha_log_path = os.path.join(args.output_dir, args.dataset.lower(), "alpha_log.jsonl")
+            with open(alpha_log_path, "w", encoding="utf-8") as f:
+                for rec in alpha_records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"[Alpha] saved {len(alpha_records)} records to {alpha_log_path}")
         with open(infer_dump_path, "wb") as f:
             pickle.dump(
                 {

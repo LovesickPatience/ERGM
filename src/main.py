@@ -16,7 +16,6 @@ from transformers import (
 from src.model.model import *
 from src.custom_dataset import *
 from eval.evaluate import Evaluator
-from selector.selector_models import SelectorConfig, build_selector
 from selector.data_preprocess import IEMOCAPDialoguePKLDataset, MELDDialoguePKLDataset
 
 
@@ -29,73 +28,6 @@ def print_custom(context, ref, sentence):
     res += "---------------------------------------------------------------\n"
     return res
 
-
-# ===== Selector Loading & Utilities =====
-
-def _load_selector(ckpt_path: str, device: str):
-    """
-    从 .pt checkpoint 加载 selector 模型（冻结 eval）
-    预期 ckpt 中包含:
-      - 'state_dict': 选择器参数
-      - 'config': SelectorConfig 对应的 dict（input_dim/hidden_dim/num_layers/dropout/mode/num_actions）
-      - 'action_set': List[List[float]] 动作权重表（如 small6 / mix3）
-    """
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"Selector ckpt not found: {ckpt_path}")
-
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    cfg_dict = ckpt["config"].copy()
-    # 兜底：老 ckpt 没有 num_actions 时从动作表推断
-    num_actions = len(ckpt.get("action_set", [])) or cfg_dict.get("num_actions", 0)
-    cfg_dict["num_actions"] = num_actions
-    cfg = SelectorConfig(**cfg_dict)
-
-    selector = build_selector("MLP", cfg)  # 如果你用的不是 MLP，这里改成对应名字
-    selector.load_state_dict(ckpt["state_dict"], strict=True)
-    selector.to(device).eval().requires_grad_(False)
-
-    action_table = ckpt["action_set"]  # List[List[float]]，例如 [[0.7,0.2,0.1], ...]
-    return selector, action_table
-
-
-@torch.no_grad()
-def _selector_pick_weights(selector, action_table, states: torch.Tensor, temperature: float = 1.0):
-    """
-    给定 selector 和 batch 状态向量，输出 (B, K) 的权重矩阵（K=模态数，通常=3）。
-    - 离散策略：softmax(logits/temperature)，取 argmax 得动作索引，再映射到具体权重。
-    """
-    out = selector(states)  # {'logits': (B, A)} for discrete
-    logits = out["logits"] / float(max(1e-6, temperature))
-    probs = torch.softmax(logits, dim=-1)
-    a_idx = probs.argmax(dim=-1)  # (B,)
-
-    # map to weights
-    at = torch.tensor(action_table, device=states.device, dtype=states.dtype)  # (A, K)
-    weights = at.index_select(dim=0, index=a_idx)  # (B, K)
-    return weights
-
-
-def _build_states(text_feat: torch.Tensor, audio_feat: torch.Tensor, video_feat: torch.Tensor, hc_feat: torch.Tensor = None):
-    """
-    把多模态的句子级特征拼成 selector 的输入（和你训练 selector 时保持一致）。
-    假设 text/audio/video 都是 (B, D_t/a/v) 的 pooled embedding。
-    """
-    xs = [text_feat, audio_feat, video_feat]
-    if hc_feat is not None:
-        xs.append(hc_feat)
-    return torch.cat(xs, dim=-1)  # (B, D_total)
-
-
-def _apply_weights(weights: torch.Tensor, text_feat: torch.Tensor, audio_feat: torch.Tensor, video_feat: torch.Tensor):
-    """
-    把 (B,K) 的权重作用到 3 个模态特征上，返回融合后的向量：
-      fused = w_T*T + w_A*A + w_V*V
-    若你的 ERGM 原始融合是 concat，这里可以返回[加权特征，再 concat 原特征] 或直接替换。
-    """
-    # 简单的线性融合
-    comps = torch.stack([text_feat, audio_feat, video_feat], dim=1)  # (B, 3, D)
-    fused = (weights.unsqueeze(-1) * comps).sum(dim=1)               # (B, D)
-    return fused
 
 class Manager:
     def __init__(self, args):
@@ -131,18 +63,6 @@ class Manager:
         self.model.config.img_id = self.args.img_id
         self.model.config.aud_id = self.args.aud_id
         self.model.resize_token_embeddings(self.args.final_vocab_size)
-        # === Load selector (optional) ===
-        self.selector = None
-        self.selector_action_table = None
-        if self.args.selector_enable != "off":
-            sel_device = self.args.selector_device or str(self.args.device)
-            try:
-                self.selector, self.selector_action_table = _load_selector(self.args.selector_ckpt, sel_device)
-                print(f"[Selector] loaded: {self.args.selector_ckpt} | actions={len(self.selector_action_table)}")
-            except Exception as e:
-                print(f"[Selector] WARNING: failed to load selector: {e}. Continue without selector.")
-                self.selector = None
-                self.selector_action_table = None
         self.args.max_len = min(self.args.max_len, self.model.config.n_ctx)
 
         if self.args.mode in ["train", "infer"]:
@@ -345,16 +265,6 @@ class Manager:
                     torch.LongTensor(emotion_labels).to(self.args.device), # Ensure emotion labels are tensors
                 )
 
-                # === selector-driven guidance injection (only when enabled) ===
-                if self.args.selector_enable != "off" and (self.selector is not None):
-                    # try:
-                    input_ids, token_type_ids, mix_w = self._maybe_apply_selector(input_ids, token_type_ids, imgs, auds)
-                    # except Exception as e:
-                    #     print(f"[Selector][train] skip due to: {e}")
-                    #     mix_w = None
-                else:
-                    mix_w = None
-
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids, labels=lm_labels,
                     imgs=imgs,
@@ -426,13 +336,6 @@ class Manager:
                     torch.LongTensor(emotion_labels).to(self.args.device),
                 )
 
-                # === selector-driven guidance injection (only when enabled) ===
-                if self.args.selector_enable != "off" and (self.selector is not None):
-                    try:
-                        input_ids, token_type_ids = self._maybe_apply_selector(input_ids, token_type_ids, imgs, auds)
-                    except Exception as e:
-                        print(f"[Selector][val] skip due to: {e}")
-
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
                     imgs=imgs,
@@ -494,207 +397,6 @@ class Manager:
         torch.cuda.manual_seed_all(seed)
         random.seed(seed)
 
-    def _pool_text_feat(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """用 GPT-2 的 token embedding 做均值池化，得到 (B, E) 的轻量文本特征供 selector 使用。"""
-        with torch.no_grad():
-            emb = self.model.transformer.wte(input_ids)  # (B, L, E)
-            feat = emb.mean(dim=1)  # (B, E)
-        return feat.float()
-
-    def _pool_modal_feat(self, x):
-        """
-        Robust pooling utility for modal features.
-
-        Accepts:
-          - Tensor: (B, D) or (B, T, D) or (T, D) or (D,)
-          - list/tuple length B where each item is (T, D) or (D,) or list of frame tensors
-
-        Returns:
-          Tensor of shape (B, D) after temporal mean pooling.
-          Assumes a consistent feature dimensionality across samples (e.g., D=64).
-        """
-        if x is None:
-            return None
-
-        # Helper: pool a single sample to 1D vector
-        def _pool_one(item):
-            # item 可能是 tensor / list[tensor or array] / array / list[list[...]]
-            if torch.is_tensor(item):
-                t = item.float()
-                if t.dim() == 2:  # (T, D)
-                    return t.mean(dim=0)
-                if t.dim() == 1:  # (D,)
-                    return t
-                if t.dim() == 3:  # (S, T, D) => 均值
-                    return t.mean(dim=(0, 1))
-                # 其他形状，尽量压成 1D
-                return t.reshape(-1)
-
-            if isinstance(item, (list, tuple)):
-                elems = []
-                for e in item:
-                    if e is None:
-                        continue
-                    if torch.is_tensor(e):
-                        elems.append(e.float().reshape(-1))
-                    else:
-                        try:
-                            te = torch.as_tensor(e, dtype=torch.float32).reshape(-1)
-                            elems.append(te)
-                        except Exception:
-                            continue
-                if len(elems) == 0:
-                    return None
-                # 尝试直接堆叠，如果形状一致就是 (T, D)
-                try:
-                    M = torch.stack(elems, dim=0)
-                    if M.dim() == 2:
-                        return M.mean(dim=0)
-                    elif M.dim() == 3:
-                        return M.mean(dim=(0, 1))
-                    else:
-                        return M.reshape(-1)
-                except RuntimeError:
-                    # 帧向量长度不一致：pad/trunc 到最大 D 再均值
-                    D = max(e.shape[0] for e in elems)
-                    padded = []
-                    for e in elems:
-                        if e.shape[0] < D:
-                            pad = torch.zeros(D - e.shape[0], dtype=e.dtype, device=e.device)
-                            padded.append(torch.cat([e, pad], dim=0))
-                        else:
-                            padded.append(e[:D])
-                    M = torch.stack(padded, dim=0)  # (T, D)
-                    return M.mean(dim=0)
-
-            # 其他可转 tensor 的类型
-            try:
-                t = torch.as_tensor(item, dtype=torch.float32)
-                if t.dim() == 2:
-                    return t.mean(dim=0)
-                if t.dim() == 1:
-                    return t
-                return t.reshape(-1)
-            except Exception:
-                return None
-
-        # 已是 Tensor 的 batch
-        if torch.is_tensor(x):
-            x = x.float()
-            if x.dim() == 3:  # (B, T, D) -> (B, D)
-                return x.mean(dim=1)
-            if x.dim() == 2:  # (B, D)
-                return x
-            if x.dim() == 1:  # (D,) -> (1, D)
-                return x.unsqueeze(0)
-            if x.dim() >= 2:  # 尝试压平
-                B = x.size(0)
-                return x.reshape(B, -1).float()
-            return None
-
-        # list/tuple 的 batch：逐样本池化 -> 对齐维度 -> stack
-        if isinstance(x, (list, tuple)) and len(x) > 0:
-            per_sample = []
-            for item in x:
-                v = _pool_one(item)
-                if v is not None:
-                    per_sample.append(v)
-
-            if len(per_sample) == 0:
-                return None
-
-            # 统一到同一 D（你现在已统一为 64，但这里仍留有保护）
-            D = per_sample[0].shape[0]
-            aligned = []
-            for v in per_sample:
-                if v.shape[0] == D:
-                    aligned.append(v)
-                elif v.shape[0] < D:
-                    pad = torch.zeros(D - v.shape[0], dtype=v.dtype)
-                    aligned.append(torch.cat([v, pad], dim=0))
-                else:
-                    aligned.append(v[:D])
-
-            return torch.stack(aligned, dim=0)  # (B, D)
-
-        return None
-
-    def _maybe_apply_selector(self, input_ids, token_type_ids, imgs, auds):
-        """
-        若启用 selector：计算 (B,3) 权重 -> 生成文本 tag -> 逐样本前缀注入 -> 重新 pad。
-        返回可能修改后的 (input_ids, token_type_ids)。
-        """
-        use_selector = (self.args.selector_enable == "train_eval") or \
-                       (self.args.selector_enable == "val" and not self.model.training)
-        if (not use_selector) or (self.selector is None):
-            return input_ids, token_type_ids
-
-        # 1) 构造 selector 的状态向量 states=(B,3D)
-        text_feat = self._pool_text_feat(input_ids).to(self.args.device)
-        vid_feat  = self._pool_modal_feat(imgs)
-        aud_feat  = self._pool_modal_feat(auds)
-        if vid_feat is None:
-            vid_feat = torch.zeros_like(text_feat)
-        else:
-            vid_feat = vid_feat.to(self.args.device)
-            if vid_feat.size(-1) != text_feat.size(-1):
-                proj = torch.nn.Linear(vid_feat.size(-1), text_feat.size(-1), bias=False).to(self.args.device)
-                with torch.no_grad():
-                    vid_feat = proj(vid_feat)
-        if aud_feat is None:
-            aud_feat = torch.zeros_like(text_feat)
-        else:
-            aud_feat = aud_feat.to(self.args.device)
-            if aud_feat.size(-1) != text_feat.size(-1):
-                proj = torch.nn.Linear(aud_feat.size(-1), text_feat.size(-1), bias=False).to(self.args.device)
-                with torch.no_grad():
-                    aud_feat = proj(aud_feat)
-
-        states = _build_states(text_feat, aud_feat, vid_feat)  # (B, 3D)
-
-        # 2) selector 选动作 -> 得到 (B,3) 权重
-        tau = getattr(self.args, 'tau', None) or self.args.selector_temperature
-        weights = _selector_pick_weights(self.selector, self.selector_action_table, states, tau)  # (B,3)
-
-        # 3) 把权重编码为文本 tag 并前缀到每个样本（与 tokenizer 兼容，最小侵入）
-        tags = []
-        for w in weights.tolist():
-            t, a, v = [max(0.0, float(x)) for x in w]
-            tags.append(f"<mw t={t:.2f} a={a:.2f} v={v:.2f}>")
-        tag_ids = [self.tokenizer.encode(t, add_special_tokens=False) for t in tags]
-
-        B = input_ids.size(0)
-        new_input = []
-        new_type  = []
-        for i in range(B):
-            ti = torch.tensor(tag_ids[i], device=self.args.device, dtype=input_ids.dtype)
-            ni = torch.cat([ti, input_ids[i]], dim=0)
-            # 对应的 token_type_ids：用 sp1_id 填充 tag 段
-            tti = torch.full((ti.size(0),), int(self.args.sp1_id), device=self.args.device, dtype=token_type_ids.dtype)
-            nti = torch.cat([tti, token_type_ids[i]], dim=0)
-            # 截断到 max_len
-            L = min(ni.size(0), self.args.max_len)
-            new_input.append(ni[:L])
-            new_type.append(nti[:L])
-
-        # 4) 重新 pad 成 batch
-        maxL = max(x.size(0) for x in new_input)
-        pad_id = self.args.eos_id
-        pad_type = int(self.args.sp1_id)
-        out_input = torch.full((B, maxL), pad_id, device=self.args.device, dtype=input_ids.dtype)
-        out_type  = torch.full((B, maxL), pad_type, device=self.args.device, dtype=token_type_ids.dtype)
-        for i in range(B):
-            L = new_input[i].size(0)
-            out_input[i, :L] = new_input[i]
-            out_type[i, :L]  = new_type[i]
-        return out_input, out_type, weights
-
-    # ── α 情感标签映射 ──────────────────────────────────────────────────
-    EMOTION_ID_TO_NAME = {
-        0: "neutral", 1: "surprise", 2: "fear", 3: "sadness",
-        4: "joy", 5: "disgust", 6: "anger", 7: "excited", 8: "frustrated",
-    }
-
     def test(self):
         print("Test processing: Collecting generated texts and references...")
         self.model.eval()
@@ -706,8 +408,6 @@ class Manager:
         all_losses = [] # For overall test PPL
         test_correct_emotions = 0
         test_total_emotions = 0
-        alpha_records = []   # α 值采集列表
-        global_idx = 0       # 全局样本计数
 
         with torch.no_grad():
             if self.args.choose_use_test_or_val == 'val':
@@ -723,14 +423,6 @@ class Manager:
                     lm_labels.to(self.args.device),
                     torch.LongTensor(emotion_labels).to(self.args.device),
                 )
-
-                # === selector-driven guidance injection (only when enabled) ===
-                batch_alpha = None  # (B, 3) 或 None
-                if self.args.selector_enable != "off" and (self.selector is not None):
-                    try:
-                        input_ids, token_type_ids, batch_alpha = self._maybe_apply_selector(input_ids, token_type_ids, imgs, auds)
-                    except Exception as e:
-                        print(f"[Selector][test] skip due to: {e}")
 
                 for i in range(input_ids.size(0)):
                     current_input = input_ids[i].unsqueeze(0)
@@ -749,28 +441,6 @@ class Manager:
 
                     all_true_labels.append(emotion_labels[i].item())
 
-                    # 采集 α 值
-                    if batch_alpha is not None:
-                        alpha_i = batch_alpha[i].cpu()
-                        alpha_T, alpha_A, alpha_V = float(alpha_i[0]), float(alpha_i[1]), float(alpha_i[2])
-                        dominant = ['text', 'audio', 'visual'][int(alpha_i.argmax().item())]
-                    else:
-                        alpha_T = alpha_A = alpha_V = None
-                        dominant = None
-                    emo_id = int(emotion_labels[i].item())
-                    alpha_records.append({
-                        'sample_id': global_idx,
-                        'emotion_label': self.EMOTION_ID_TO_NAME.get(emo_id, str(emo_id)),
-                        'emotion_label_id': emo_id,
-                        'alpha_T': alpha_T,
-                        'alpha_A': alpha_A,
-                        'alpha_V': alpha_V,
-                        'dominant_modality': dominant,
-                        'generated_text': hypothesis_text,
-                        'ground_truth_text': reference_text,
-                    })
-                    global_idx += 1
-
                 outputs = self.model(input_ids=input_ids, token_type_ids=token_type_ids, labels=lm_labels, emotion_labels=emotion_labels)
                 preds = torch.argmax(outputs.emotion_logits, dim=-1)
                 test_correct_emotions += (preds == emotion_labels).sum().item()
@@ -782,17 +452,6 @@ class Manager:
                 all_losses.append(lm_loss.item())
 
         test_acc = (test_correct_emotions / test_total_emotions) * 100 if test_total_emotions > 0 else 0.0
-
-        # 保存 α 日志
-        if alpha_records and any(r['alpha_T'] is not None for r in alpha_records):
-            import json
-            alpha_out_dir = os.path.join(self.args.output_dir, self.args.dataset.lower())
-            os.makedirs(alpha_out_dir, exist_ok=True)
-            alpha_log_path = os.path.join(alpha_out_dir, 'alpha_log.jsonl')
-            with open(alpha_log_path, 'w', encoding='utf-8') as f:
-                for r in alpha_records:
-                    f.write(json.dumps(r, ensure_ascii=False) + '\n')
-            print(f"[Alpha] saved {len(alpha_records)} records to {alpha_log_path}")
 
         return all_hypotheses, all_references, all_true_labels, all_losses, test_acc
 
@@ -820,13 +479,6 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_dir", type=str, default="/root/autodl-tmp/ERGM-main/save_model", help="The directory name for saved checkpoints.")
     parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/ERGM-main/eval/output", help="The directory name for outputs.")
     parser.add_argument("--ckpt_name", type=str, default=None, help="The name of the trained checkpoint (without extension).")
-    parser.add_argument("--selector_ckpt", type=str, default="checkpoints/selector/latest.pt", help="路径指向你训练好的 selector checkpoint（.pt）")
-    parser.add_argument("--selector_device", type=str, default=None, help="selector 推理放到哪块设备；默认跟主模型一致")
-    parser.add_argument("--selector_temperature", type=float, default=1.0, help="离散策略温度：>1更平；<1更尖锐；一般 1.0 即可")
-    parser.add_argument("--tau", type=float, default=None,
-                        help="推理时 MRD 温度缩放 τ（覆盖 selector_temperature）；不传则沿用 selector_temperature 默认值 1.0")
-    parser.add_argument("--selector_enable", type=str, choices=["off", "val", "train_eval"], default="off",
-                        help="off=不用selector；val=只在验证/测试用；train_eval=训练和验证都用")
     parser.add_argument("--dataset", type=str, default="ERGM", choices=["ERGM", "IEMOCAP", "MELD"], help="Choose data pipeline. IEMOCAP uses PKL+JSON via IEMOCAPDialoguePKLDataset. MELD uses JSON+separate A/V PKLs.")
     parser.add_argument("--train_pkls", type=str, default=None, help="(IEMOCAP) path to train PKL or a comma-separated list of PKLs")
     parser.add_argument("--val_pkls", type=str, default=None, help="(IEMOCAP) path to val PKL or a comma-separated list of PKLs")
