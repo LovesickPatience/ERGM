@@ -688,6 +688,12 @@ class Manager:
             out_type[i, :L]  = new_type[i]
         return out_input, out_type, weights
 
+    # ── α 情感标签映射 ──────────────────────────────────────────────────
+    EMOTION_ID_TO_NAME = {
+        0: "neutral", 1: "surprise", 2: "fear", 3: "sadness",
+        4: "joy", 5: "disgust", 6: "anger", 7: "excited", 8: "frustrated",
+    }
+
     def test(self):
         print("Test processing: Collecting generated texts and references...")
         self.model.eval()
@@ -699,6 +705,8 @@ class Manager:
         all_losses = [] # For overall test PPL
         test_correct_emotions = 0
         test_total_emotions = 0
+        alpha_records = []   # α 值采集列表
+        global_idx = 0       # 全局样本计数
 
         with torch.no_grad():
             if self.args.choose_use_test_or_val == 'val':
@@ -716,9 +724,10 @@ class Manager:
                 )
 
                 # === selector-driven guidance injection (only when enabled) ===
+                batch_alpha = None  # (B, 3) 或 None
                 if self.args.selector_enable != "off" and (self.selector is not None):
                     try:
-                        input_ids, token_type_ids = self._maybe_apply_selector(input_ids, token_type_ids, imgs, auds)
+                        input_ids, token_type_ids, batch_alpha = self._maybe_apply_selector(input_ids, token_type_ids, imgs, auds)
                     except Exception as e:
                         print(f"[Selector][test] skip due to: {e}")
 
@@ -736,8 +745,30 @@ class Manager:
                     ref_ids = lm_labels[i][lm_labels[i] != -100] # Filter out padding
                     reference_text = self.tokenizer.decode(ref_ids, skip_special_tokens=True)
                     all_references.append(reference_text)
-                    
+
                     all_true_labels.append(emotion_labels[i].item())
+
+                    # 采集 α 值
+                    if batch_alpha is not None:
+                        alpha_i = batch_alpha[i].cpu()
+                        alpha_T, alpha_A, alpha_V = float(alpha_i[0]), float(alpha_i[1]), float(alpha_i[2])
+                        dominant = ['text', 'audio', 'visual'][int(alpha_i.argmax().item())]
+                    else:
+                        alpha_T = alpha_A = alpha_V = None
+                        dominant = None
+                    emo_id = int(emotion_labels[i].item())
+                    alpha_records.append({
+                        'sample_id': global_idx,
+                        'emotion_label': self.EMOTION_ID_TO_NAME.get(emo_id, str(emo_id)),
+                        'emotion_label_id': emo_id,
+                        'alpha_T': alpha_T,
+                        'alpha_A': alpha_A,
+                        'alpha_V': alpha_V,
+                        'dominant_modality': dominant,
+                        'generated_text': hypothesis_text,
+                        'ground_truth_text': reference_text,
+                    })
+                    global_idx += 1
 
                 outputs = self.model(input_ids=input_ids, token_type_ids=token_type_ids, labels=lm_labels, emotion_labels=emotion_labels)
                 preds = torch.argmax(outputs.emotion_logits, dim=-1)
@@ -750,6 +781,18 @@ class Manager:
                 all_losses.append(lm_loss.item())
 
         test_acc = (test_correct_emotions / test_total_emotions) * 100 if test_total_emotions > 0 else 0.0
+
+        # 保存 α 日志
+        if alpha_records and any(r['alpha_T'] is not None for r in alpha_records):
+            import json
+            alpha_out_dir = os.path.join(self.args.output_dir, self.args.dataset.lower())
+            os.makedirs(alpha_out_dir, exist_ok=True)
+            alpha_log_path = os.path.join(alpha_out_dir, 'alpha_log.jsonl')
+            with open(alpha_log_path, 'w', encoding='utf-8') as f:
+                for r in alpha_records:
+                    f.write(json.dumps(r, ensure_ascii=False) + '\n')
+            print(f"[Alpha] saved {len(alpha_records)} records to {alpha_log_path}")
+
         return all_hypotheses, all_references, all_true_labels, all_losses, test_acc
 
 
