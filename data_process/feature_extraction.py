@@ -27,6 +27,7 @@ from transformers import (
     CLIPProcessor,
     CLIPModel,
     AutoFeatureExtractor,
+    AutoModel,
 )
 
 
@@ -101,10 +102,10 @@ def extract_audio_features(audio_path, model_name: str = "facebook/hubert-large-
     """
     try:
         processor = AutoFeatureExtractor.from_pretrained(model_name)
-        model = HubertModel.from_pretrained(model_name).to(device)
+        model = AutoModel.from_pretrained(model_name).to(device)
         model.eval()
     except Exception as e:
-        print(f"[audio] failed to load HuBERT ({model_name}): {e}")
+        print(f"[audio] failed to load audio model ({model_name}): {e}")
         return None
 
     try:
@@ -166,10 +167,10 @@ def extract_audio_dir(
     # prepare model once
     try:
         processor = AutoFeatureExtractor.from_pretrained(model_name)
-        model = HubertModel.from_pretrained(model_name).to(device)
+        model = AutoModel.from_pretrained(model_name).to(device)
         model.eval()
     except Exception as e:
-        raise RuntimeError(f"Failed to load HuBERT model {model_name}: {e}") from e
+        raise RuntimeError(f"Failed to load audio model {model_name}: {e}") from e
 
     # iterate wav files
     wav_files = [

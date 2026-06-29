@@ -778,3 +778,248 @@ class PadCollate():
                 emotion_labels,
             )
         return collate
+
+    # ============================================================
+    # ChatML-template based collates (for Qwen2.5-Omni Thinker SFT)
+    # ============================================================
+    # These build inputs via tokenizer.apply_chat_template so that the
+    # token distribution matches what Qwen was pre-trained / SFT-ed on.
+    # Loss is computed only on the assistant response by masking the
+    # prompt portion with -100.
+    #
+    # Returned 7-tuple keeps the original signature so the training loops
+    # in main_qwen.py / main_qwen_with_selector.py need no change:
+    #   (input_ids, token_type_ids, labels, imgs, auds, contexts, emotion_labels)
+    # token_type_ids is filled with zeros (Qwen2 ignores it; we keep the
+    # slot to satisfy the custom forward signature).
+
+    def _chatml_encode_one(self, tokenizer, messages_prompt, response_text, max_len):
+        """Encode one sample under chat template.
+
+        Returns (input_ids: LongTensor, labels: LongTensor) where labels are
+        -100 on the prompt portion and equal to input_ids on the assistant
+        response portion (including the closing <|im_end|> emitted by the
+        template, so the model learns when to stop).
+        """
+        prompt_str = tokenizer.apply_chat_template(
+            messages_prompt, tokenize=False, add_generation_prompt=True
+        )
+        prompt_ids = tokenizer(
+            prompt_str, add_special_tokens=False, return_tensors='pt'
+        ).input_ids[0].to(torch.long)
+
+        messages_full = list(messages_prompt) + [
+            {"role": "assistant", "content": response_text}
+        ]
+        full_str = tokenizer.apply_chat_template(
+            messages_full, tokenize=False, add_generation_prompt=False
+        )
+        full_ids = tokenizer(
+            full_str, add_special_tokens=False, return_tensors='pt'
+        ).input_ids[0].to(torch.long)
+
+        prompt_len = prompt_ids.size(0)
+        # Defensive fallback for rare tokenization drift.
+        if full_ids.size(0) <= prompt_len or not torch.equal(full_ids[:prompt_len], prompt_ids):
+            eos_str = tokenizer.eos_token if tokenizer.eos_token else ""
+            resp_only = tokenizer(
+                response_text + eos_str,
+                add_special_tokens=False, return_tensors='pt'
+            ).input_ids[0].to(torch.long)
+            full_ids = torch.cat([prompt_ids, resp_only], dim=0)
+            prompt_len = prompt_ids.size(0)
+
+        # Truncate from the LEFT of the prompt if too long; keep full response.
+        if full_ids.size(0) > max_len:
+            overflow = full_ids.size(0) - max_len
+            resp_len = full_ids.size(0) - prompt_len
+            if overflow < prompt_len:
+                full_ids = full_ids[overflow:]
+                prompt_len = prompt_len - overflow
+            else:
+                full_ids = full_ids[-resp_len:]
+                prompt_len = 0
+
+        labels = full_ids.clone()
+        labels[:prompt_len] = -100
+        return full_ids, labels
+
+    def iemocap_collate_chatml(self, tokenizer, a_dim: int = 512, v_dim: int = 512,
+                                system_prompt: str = "You are an empathetic dialogue assistant. "
+                                                      "Continue the conversation by responding as the next speaker."):
+        """ChatML collate for IEMOCAP. Each context utterance becomes a user
+        message (prefixed with 'Speaker A:' / 'Speaker B:' to preserve
+        identity); the to-be-predicted utterance is the assistant message.
+        """
+        def _stack_1d(x):
+            t = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
+            if t.ndim == 2:
+                t = t.mean(dim=0)
+            return t.to(torch.float32)
+
+        _EMO_MAP = getattr(self.args, 'emo_map', None)
+        if _EMO_MAP is None:
+            _EMO_MAP = {
+                'neutral': 0, 'neu': 0, 'others': 0,
+                'hap': 1, 'joy': 1,
+                'sad': 2, 'sadness': 2,
+                'ang': 3, 'anger': 3,
+                'sur': 4, 'dis': 5, 'fea': 6, 'fru': 7, 'exc': 8,
+            }
+
+        # Modality placeholder strings (Qwen2.5-Omni dedicated IMAGE/AUDIO
+        # tokens). We surface them inside the system message so the custom
+        # forward (which scans for image_token_id / audio_token_id) can
+        # still inject features at those positions.
+        img_tok = getattr(self.args, 'img_token', None)
+        aud_tok = getattr(self.args, 'aud_token', None)
+        max_len = getattr(self.args, 'max_len', 1024)
+
+        def collate(batch):
+            input_ids_list, labels_list = [], []
+            imgs, auds, contexts, emotion_labels = [], [], [], []
+
+            for b in batch:
+                utt_texts = b.get('ctx_utt_texts', None)
+                sp_ids = b.get('ctx_speaker_ids', None)
+                if utt_texts is None or sp_ids is None or len(utt_texts) == 0:
+                    utt_texts = [b.get('ctx_text', '')]
+                    sp_ids = [0]
+                label_text = b.get('label_text', '')
+                contexts.append(b.get('ctx_text', ''))
+
+                modal_prefix = ""
+                if img_tok:
+                    modal_prefix += img_tok
+                if aud_tok:
+                    modal_prefix += aud_tok
+                sys_content = (modal_prefix + "\n" if modal_prefix else "") + system_prompt
+                messages_prompt = [{"role": "system", "content": sys_content}]
+                for utt, sid in zip(utt_texts, sp_ids):
+                    name = "Speaker A" if int(sid) == 0 else "Speaker B"
+                    messages_prompt.append({
+                        "role": "user",
+                        "content": f"{name}: {utt}",
+                    })
+
+                full_ids, lbl = self._chatml_encode_one(
+                    tokenizer, messages_prompt, label_text, max_len
+                )
+
+                input_ids_list.append(full_ids)
+                labels_list.append(lbl)
+
+                af_src = b.get('audio_feats', b.get('audio_feat', None))
+                vf_src = b.get('video_feats', b.get('video_feat', None))
+                af = _stack_1d(af_src) if af_src is not None else torch.zeros(a_dim, dtype=torch.float32)
+                vf = _stack_1d(vf_src) if vf_src is not None else torch.zeros(v_dim, dtype=torch.float32)
+                seq_len = full_ids.size(0)
+                imgs.append([vf.clone() for _ in range(seq_len)])
+                auds.append([af.clone() for _ in range(seq_len)])
+
+                emo = b.get('emotion_label', None)
+                if emo is None:
+                    emo = _EMO_MAP.get(str(b.get('erc_label_text', 'neu')).lower(), 0)
+                emotion_labels.append(int(emo))
+
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
+            labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+            token_type_ids = torch.zeros_like(input_ids)
+
+            return (
+                input_ids,
+                token_type_ids,
+                labels,
+                imgs,
+                auds,
+                contexts,
+                emotion_labels,
+            )
+        return collate
+
+    def meld_collate_chatml(self, tokenizer, a_dim: int = 1024, v_dim: int = 768,
+                             system_prompt: str = "You are an empathetic dialogue assistant. "
+                                                   "Continue the conversation by responding as the next speaker."):
+        """ChatML collate for MELD. Uses the actual character name (from
+        ctx_speakers) as a 'Name:' prefix inside each user message.
+        """
+        def _stack_1d(x):
+            t = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
+            if t.ndim == 2:
+                t = t.mean(dim=0)
+            return t.to(torch.float32)
+
+        _EMO_MAP = getattr(self.args, 'emo_map', None)
+        if _EMO_MAP is None:
+            _EMO_MAP = {
+                'anger': 0, 'neutral': 1, 'sadness': 2,
+                'surprise': 3, 'joy': 4, 'fear': 5, 'disgust': 6,
+            }
+
+        img_tok = getattr(self.args, 'img_token', None)
+        aud_tok = getattr(self.args, 'aud_token', None)
+        max_len = getattr(self.args, 'max_len', 1024)
+
+        def collate(batch):
+            input_ids_list, labels_list = [], []
+            imgs, auds, contexts, emotion_labels = [], [], [], []
+
+            for b in batch:
+                utt_texts = b.get('ctx_utt_texts', None)
+                speakers = b.get('ctx_speakers', None) or []
+                if utt_texts is None or len(utt_texts) == 0:
+                    utt_texts = [b.get('ctx_text', '')]
+                    speakers = ["Unknown"]
+                label_text = b.get('label_text', '')
+                contexts.append(b.get('ctx_text', ''))
+
+                modal_prefix = ""
+                if img_tok:
+                    modal_prefix += img_tok
+                if aud_tok:
+                    modal_prefix += aud_tok
+                sys_content = (modal_prefix + "\n" if modal_prefix else "") + system_prompt
+                messages_prompt = [{"role": "system", "content": sys_content}]
+                for i, utt in enumerate(utt_texts):
+                    name = speakers[i] if i < len(speakers) and speakers[i] else "Speaker"
+                    messages_prompt.append({
+                        "role": "user",
+                        "content": f"{name}: {utt}",
+                    })
+
+                full_ids, lbl = self._chatml_encode_one(
+                    tokenizer, messages_prompt, label_text, max_len
+                )
+
+                input_ids_list.append(full_ids)
+                labels_list.append(lbl)
+
+                af_src = b.get('audio_feats', b.get('audio_feat', None))
+                vf_src = b.get('video_feats', b.get('video_feat', None))
+                af = _stack_1d(af_src) if af_src is not None else torch.zeros(a_dim, dtype=torch.float32)
+                vf = _stack_1d(vf_src) if vf_src is not None else torch.zeros(v_dim, dtype=torch.float32)
+                seq_len = full_ids.size(0)
+                imgs.append([vf.clone() for _ in range(seq_len)])
+                auds.append([af.clone() for _ in range(seq_len)])
+
+                emo = b.get('emotion_label', None)
+                if emo is None:
+                    emo = _EMO_MAP.get(str(b.get('erc_label_text', 'neutral')).lower(), 1)
+                emotion_labels.append(int(emo))
+
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
+            labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+            token_type_ids = torch.zeros_like(input_ids)
+
+            return (
+                input_ids,
+                token_type_ids,
+                labels,
+                imgs,
+                auds,
+                contexts,
+                emotion_labels,
+            )
+        return collate

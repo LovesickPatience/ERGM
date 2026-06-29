@@ -198,7 +198,7 @@ class Manager:
                     test_set = IEMOCAPDialoguePKLDataset(pkl_path=test_pkl_list[0],
                                                          json_path=self.args.iemocap_text_json, split='test')
 
-                collate = ppd.iemocap_collate(self.tokenizer)
+                collate = ppd.iemocap_collate_chatml(self.tokenizer)
                 if args.mode == 'train':
                     self.train_loader = DataLoader(
                         train_set, collate_fn=collate, shuffle=True,
@@ -257,7 +257,7 @@ class Manager:
                         split="test",
                     )
 
-                collate = ppd.meld_collate(self.tokenizer, add_modal_prefix=True)
+                collate = ppd.meld_collate_chatml(self.tokenizer)
                 if args.mode == 'train':
                     self.train_loader = DataLoader(
                         train_set, collate_fn=collate, shuffle=True,

@@ -318,6 +318,8 @@ class IEMOCAPDialoguePKLDataset(Dataset):
                 self.samples.append({
                     "dialogue_id": dlg_id,
                     "ctx_text": ctx_text,
+                    # per-utterance raw texts of the context, for chat-template based collates
+                    "ctx_utt_texts": [u.get("text", "") for u in ctx_utts],
                     "utt_bounds": utt_bounds,
                     "token_offsets": token_offsets,
 
@@ -428,6 +430,11 @@ class MELDDialoguePKLDataset(Dataset):
                 self.samples.append({
                     "dialogue_id": dlg_id,
                     "ctx_text": ctx_text,
+                    # per-utterance raw texts of the context, for chat-template based collates
+                    "ctx_utt_texts": [u.get("text", "") for u in ctx_utts],
+                    # per-utterance speaker labels (raw, e.g. character names from MELD JSON)
+                    "ctx_speakers": [u.get("speaker", "UNK") for u in ctx_utts],
+                    "label_speaker": label_utt.get("speaker", "UNK"),
                     "utt_bounds": utt_bounds,
                     "token_offsets": token_offsets,
                     "audio_feats": a_stack,

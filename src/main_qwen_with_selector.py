@@ -105,6 +105,12 @@ class Manager:
         )
         self.model.resize_token_embeddings(self.args.final_vocab_size)
 
+        # use model-defined multimodal placeholders (needed by chatml collate)
+        self.args.img_token = self.tokenizer.convert_ids_to_tokens(self.model.config.image_token_id)
+        self.args.aud_token = self.tokenizer.convert_ids_to_tokens(self.model.config.audio_token_id)
+        self.args.img_token_id = int(self.model.config.image_token_id)
+        self.args.aud_token_id = int(self.model.config.audio_token_id)
+
         # apply LoRA to save memory if requested
         if getattr(self.args, "use_lora", False):
             target_modules = [m.strip() for m in self.args.lora_target_modules.split(",") if m.strip()]
@@ -155,7 +161,7 @@ class Manager:
                     test_set = IEMOCAPDialoguePKLDataset(pkl_path=test_pkl_list[0],
                                                          json_path=self.args.iemocap_text_json, split='test')
 
-                collate = ppd.iemocap_collate(self.tokenizer)
+                collate = ppd.iemocap_collate_chatml(self.tokenizer)
                 if args.mode == 'train':
                     self.train_loader = DataLoader(
                         train_set, collate_fn=collate, shuffle=True,
@@ -213,7 +219,7 @@ class Manager:
                         eos=self.args.eos_token,
                     )
 
-                collate = ppd.meld_collate_without_prefix(self.tokenizer)
+                collate = ppd.meld_collate_chatml(self.tokenizer)
                 if args.mode == 'train':
                     self.train_loader = DataLoader(
                         train_set, collate_fn=collate, shuffle=True,
