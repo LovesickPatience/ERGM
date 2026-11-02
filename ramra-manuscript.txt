@@ -1,0 +1,630 @@
+===== PAGE 1 =====
+Richness-Aware Modality-Role Assignment for
+Multimodal Emotional Dialogue Generation
+Mingting Yu[0009-0007-4247-0747], Changhong Jiang[0000-0002-2647-3987]⋆,
+Zhongtian Hu[0000-0001-5349-4751], Wei Zhang[0000-0003-2951-4833], and
+Lulu Wang[0009-0001-8052-5987]
+Northwestern Polytechnical University, Xi’an 710129, China
+mingtingyu@mail.nwpu.edu.cn, chjiang@nwpu.edu.cn,
+ahxchzt@mail.nwpu.edu.cn, zhang_wei@mail.nwpu.edu.cn,
+wangllu@mail.nwpu.edu.cn
+Abstract.Multimodal emotional dialogue generation (EDG) has ben-
+efited from increasingly powerful fusion architectures, yet many systems
+still adopt a text-centric and statically fused multimodal pipeline and fail
+to fully exploit audio–visual affective cues whose salience varies across
+dialogue contexts. We presentRaMRA, arichness-aware modality-role
+assignmentframework that estimates the semantic–sentiment informa-
+tiveness of text, audio, and vision and dynamically assigns instance-level
+dominant/auxiliary roles. The dominant stream serves as an interaction
+hubforrole-conditionedcross-modalattention,whileresponsegeneration
+remains anchored in the textual context. Experiments on IEMOCAP and
+MELD demonstrate that RaMRA consistently improves fluency, seman-
+tic alignment, and emotion consistency over strong baselines, underscor-
+ing the importance of adaptive multimodal affect perception for building
+emotionally intelligent dialogue agents.
+Keywords:Multimodal dialogue generation·Modality-role assignment
+·Role-aware fusion·Affective computing·Emotional intelligence
+1 Introduction
+Dialogue generation has become a core interface for intelligent customer service,
+virtual assistants, and everyday human–computer interaction. While neural gen-
+erators increasingly master coherence and contextual relevance, they still tend
+to under-model affect, resulting in responses that sound fluent yet emotionally
+off-target [8]. Emotional dialogue generation (EDG) therefore seeks to produce
+replies that are not only contextually appropriate but also aligned with the
+speaker’s affective state—a capability at the heart ofemotional intelligencein
+human–AI interaction and a prerequisite for truly empathetic dialogue agents.
+⋆ Corresponding author.
+===== PAGE 2 =====
+2 M. Yu et al.
+But then who? The waitress 
+I went out with last month?
+Dialogue
+You know? Forget it!
+No-no-no-no, no! Who, who 
+were you talking about?
+Emotion Prior KBAdaptive Modality
+Traditional
+Ours
+Response：
+I… I didn’t mean anyone—okay? Just drop 
+it. Please. Don’t make me say it.
+Emotion: Fear/Awkward
+Response：
+I… I didn’t mean anyone—okay? Just drop 
+it. Please. Don’t make me say it.
+Emotion: Fear/Awkward
+Response：
+Come on. Don’t act surprised.
+Emotion: Surprise
+Emotion: Surprise
+Response：
+Come on. Don’t act surprised.
+Emotion: Surprise
+Semantics:
+Semantics:
+Semantics:
+Fig. 1.Motivation and overview ofRaMRA. Conventional multimodal EDG is often
+text-centric, which can overlook context-dependent affective cues. The Modality-Role
+Discriminator and Role-Aware Fusion Module jointly assign primary/auxiliary roles
+and route fusion through the primary modality, while anEmotion Prior KBinjects
+affective priors to improve emotion-aligned generation.
+Multimodal EDG is often motivated by a simple observation: the same words
+can convey different emotions under different prosody or facial display. Recent
+systems accordingly incorporate audio and vision [3,6], yet many pipelines re-
+maintext-centricin a structural sense—text acts as the default backbone, and
+non-textstreamsareappendedasauxiliaryrefinementsorglobalconditions.This
+design implicitly assumes that extra modalities are uniformly helpful, which is
+rarely true in practice: acoustic cues may dominate when wording is neutral but
+tone is tense, while facial expressions can be decisive when speech is short or
+ambiguous. Even systems built around afixednon-text primary modality inherit
+the same limitation—the weighting prior is predetermined rather than inferred
+per instance, making them brittle under modality-specific noise, missing cues,
+or cross-modal incongruence [22,12,6]. This motivates a key question: “can mul-
+timodal EDG explicitly decide which modality should lead the interaction for
+each dialogue context, while keeping generation anchored to textual discourse?”
+As illustrated in Fig. 1, we argue that multimodal EDG should separate
+two functional roles: (i) agrounding channelthat preserves dialogue seman-
+tics and controllability (naturally, text), and (ii) aninteraction hubthat adap-
+tively routes cross-modal affective evidence to maximize emotional reliability.
+To instantiate this principle, we proposeRaMRA1, an informativeness-driven
+modality-role assignment and role-conditioned interaction framework within a
+decoder-only generation pipeline. For each dialogue context, RaMRA estimates
+thesemantic–sentimentinformativenessoftext,audio,andvision,assignsadom-
+inant/auxiliary role configuration, and performs cross-modal exchangeasymmet-
+rically: the dominant modality serves as the sole query source for cross-modal
+attention, while auxiliary streams contribute evidence only through value vec-
+tors modulated by their informativeness weights. This role-based asymmetry dis-
+1 RaMRA stands forRichness-awareModality-RoleAssignment.
+===== PAGE 3 =====
+Richness-Aware Modality-Role Assignment for Multimodal EDG 3
+tinguishes RaMRA from prior dynamic fusion approaches [21,15,24,14], which
+reweight modality contributions throughscalargates yet still maintain symmet-
+ric participation of every modality in attention. In RaMRA, high-quality signals
+are amplified through hub-based routing rather than averaged with noise from
+less reliable streams. Decoding remains anchored in textual discourse, and an
+auxiliary emotion prediction objective on decoder hidden states further tightens
+the coupling between affective understanding and response generation [8].
+Our contributions are threefold:
+1.Role-based reformulation.We formulate multimodal EDG asinstance-
+level modality-role assignmentand propose a richness-aware criterion that
+assigns roles based on semantic–sentiment informativeness.
+2.Role-based asymmetric fusion.We introduce role-conditioned asymmet-
+ric interaction that routes cross-modal evidence via gated attention, reducing
+redundancy and interference from less informative streams.
+3.F ramework & validation.We present RaMRA as a plug-in framework on
+top of a decoder-only generator with frozen modality encoders, and validate
+its effectiveness on IEMOCAP and MELD through analyses and ablations.
+2 Related Work
+Emotional Dialogue Generation.Emotional dialogue generation (EDG) aims to
+produce responses that are both contextually coherent and emotionally aligned
+with the speaker’s affective state. Text-only approaches have progressively en-
+richedaffectivegroundingthroughcommonsenseknowledgeinfusion[9],emotion-
+sensitive recognition [13], coarse-to-fine cognition–affection alignment [27], and
+iterative associative memory [23]. A closely related upstream task, multimodal
+emotion recognition in conversations (ERC), provides the perceptual founda-
+tion that EDG systems rely on; recent ERC advances include attention-based
+correlation-aware fusion [10], adaptive graph learning [11], and graph-spectral
+analysis of cross-modal emotion dynamics [1], as surveyed in [16].
+Building on these recognition capabilities, multimodal EDG systems have
+begun to incorporate audio and visual signals alongside text. Representative ef-
+fortsincludetheopen-sourceavatarchatbotEmpathyEar[3],theemotion-guided
+LLM pipeline SpeakFromHeart [6], multi-modality fusion in ERGM [18], LLM-
+driven empathetic speech generation in EmpathyOmni [12], the text-speech-
+vision avatar benchmark AvaMERG [25], and personality-aware multimodal em-
+pathetic generation [17]. Despite their progress, these systems share a common
+architectural assumption: either text serves as the fixed backbone with non-text
+streams appended as auxiliary signals, or a single non-text modality is pre-
+designated as the primary channel. Neither design adapts to theinstance-level
+variation in modality salience that naturally arises in emotional conversations.
+Dynamic and Non-uniform Multimodal Fusion.Standard multimodal fusion
+strategies—such as concatenation, element-wise gating, and symmetric cross-
+attention—treat all modalities as equally informative, which can amplify noise
+===== PAGE 4 =====
+4 M. Yu et al.
+Visual Encoder Audio Encoder Text Encoder
+Modality Role Discriminator
+Role-Aware Fusion Module
+Multimodal-Conditioned Decoder
+Emotion-Aware Decoding Unit
+hidden states
+Ê
+Affective Empathy
+ResponseResponse
+visual head audio head text head
+concat
+softmax/argmax
+GateNet
+self-attncross-attn cross-attn
+main_faux_f1 aux_f2
+concat & project
+k, v k, v
+② Modality Role Discriminator
+③ Role-Aware Fusion Module① RaMRA Main Structure ​
+Xm* , Xm1 , Xm2
+αₘ 
+αₘ 
+αₘ 
+Hfus
+Fig. 2.Architecture ofRaMRA, organized in three panels read in the order
+(1)→(2)→(3) to mirror the data flow.(1) RaMRA Main Structure(left): the end-
+to-end pipeline where frozen encoders feed the Modality-Role Discriminator (MRD),
+whose role weightsαm drive the Role-Aware Fusion Module (RAF), and an Emotion-
+Aware Decoding Unit supplies auxiliary affective supervision on decoder hidden states.
+Panels (2) and (3) zoom into the two highlighted submodules of (1):(2) MRD
+(bottom-right) producesα m via gated tri-tower scoring, and(3) RAF(top-right) per-
+forms asymmetric routing where the dominant stream serves as the sole query source
+for cross-attention over auxiliaries, yieldingHfus for the decoder in (1).
+from unreliable streams and dilute discriminative affective cues [4]. To address
+this, Dynamic Multimodal Fusion [21] estimates per-modality reliability at test
+time and adjusts contribution weights accordingly; HCMS [15] introduces hier-
+archical and conditional modality selection for efficient video recognition; and
+pre-gating with contextual attention gating [24] provides learnable mechanisms
+to suppress noisy channels before fusion. More recent work explores adaptive
+modality weighting through multimodal transformers [14] and multi-loss opti-
+mization across heterogeneous feature encoders [19], both targeting sentiment
+analysis. While these methods adaptively reweight modality contributions, they
+typically apply scalar adjustments that keep every modality symmetrically en-
+gaged in fusion, which is precisely the limitation RaMRA addresses through
+explicit dominant/auxiliary role assignment and asymmetric, role-conditioned
+routing (as outlined in Sec. 1).
+3 Methodology
+Task Definition.Westudymultimodalemotionaldialoguegenerationwithaligned
+text, audio, and vision. Given a dialogue context, we generate a contextually ap-
+propriate and emotion-aligned response; emotion labels are used only for training
+===== PAGE 5 =====
+Richness-Aware Modality-Role Assignment for Multimodal EDG 5
+supervision and are not available at inference. Fig. 2 overviews RaMRA, which
+assigns modality roles to route cross-modal evidence while keeping decoding
+grounded in text.
+3.1 Modality-Role Discriminator
+LetM={T, A, V}denotetext,audio, andvision. Given a dialogue context,
+modality-specific encoders map raw inputs to modality-level embeddings:
+xm =E m(inputm), m∈ M,(1)
+whereE T , EA, EV are fixed feature extractors. RaMRA operates exclusively on
+{xm}, avoiding direct dependence on raw waveforms or frames.
+Tri-Tower Richness Scoring with Gated Calibration.We adopt a tri-tower pa-
+rameterization to compute modality-specific latent summaries:
+hm =ϕ
+ 
+LN(W(h)m xm +b (h)m ), m∈ M,(2)
+whereϕ(·)is a nonlinearity andLN(·)stabilizes representation scales. To sup-
+press unreliable dimensions, we introduce a learnable multiplicative gate:
+gm =σ
+ 
+W(g)m xm +b (g)m ,(3)
+˜hm =g m ⊙h m,(4)
+with sigmoidσ(·)and Hadamard product⊙. We then derive a scalar informa-
+tiveness score via an affine readout:
+sm =u ⊤m ˜hm +c m,(5)
+and convert scores into a continuous role distribution using a temperature-scaled
+normalization:
+αm = exp(sm/τ)P
+m′∈M exp(sm′/τ) , m∈ M,(6)
+whereτcontrols the sharpness of the role distribution.
+We defineinformativeness(orrichness) operationally as the expected contri-
+bution of a modality to the joint objectives of semantic coherence and sentiment
+prediction in the current dialogue context. Concretely, for each modalitym, the
+gated latent summary˜hm (Eq. 4) isolates dimensions that carry discriminative
+affective and semantic value by multiplicatively suppressing uninformative chan-
+nels; the scalar scoresm (Eq. 5) then aggregates this filtered signal into a single
+informativeness estimate. The entire pathway—from modality encoding through
+gating to scoring—is learned end-to-end under the combined language modeling
+and emotion classification losses (Eq. 15), so that a highsm reflects evidence that
+is simultaneously useful for generating fluent, coherent text and for predicting
+the speaker’s emotion. This joint optimization ensures that informativeness is
+===== PAGE 6 =====
+6 M. Yu et al.
+not a hand-crafted heuristic but an empirically grounded quantity aligned with
+the downstream task.
+We interpretα= (α T , αA, αV )as instance-level role signals: the modality
+with the largest weight is thedominantstream, and the remaining modalities
+serve as auxiliary evidence providers.
+3.2 Role-A ware F usion Module
+Conditioned onα, the fusion module integrates multimodal cues by explicitly
+routing cross-modal interactions through the dominant stream, rather than ap-
+plying uniform aggregation.
+Tokenized Descriptors.LetX m ∈R Lm×H be the sequence-like representation of
+modalitymafter projecting all modalities to a shared hidden sizeH(e.g., via
+linear adapters). HereL T is the number of text tokens, whileLA andL V are
+pseudo-token lengths for acoustic/visual descriptors.
+Role-Conditioned Routing.We define the dominant modality index
+m⋆ = arg max
+m∈M
+αm,(7)
+and the auxiliary setM¬m⋆ =M \ {m⋆}. The full distributionαis retained for
+continuous weighting, whilem⋆ specifies the interaction hub. Althougharg max
+introduces a discrete selection, cross-modal evidence from auxiliary modalities
+is integrated throughcontinuousweightsα m (Eq. 6), so near-tie cases (e.g.,
+αA = 0.49vs.α V = 0.51) yield only marginal changes in the fused representation
+when the hub identity swaps; the temperatureτadditionally keeps the role
+distribution soft near decision boundaries.
+Intra-Stream Refinement.We first apply self-attention to the dominant stream:
+Sm⋆ = Attn
+
+Xm⋆ WQm⋆ ,X m⋆ WKm⋆ ,X m⋆ WVm⋆
+
+,(8)
+Cross-Modal Integration.For each auxiliary modalitym∈ M¬m⋆, we compute
+dominant-query cross-attention:
+Cm→m⋆ = Attn
+
+Xm⋆ WQm⋆ ,X mWKm,X mWVm
+
+,(9)
+and modulate it by the corresponding role weight:
+bCm→m⋆ =α m ·C m→m⋆ .(10)
+HereAttn(Q,K,V) = softmax
+ 
+QK⊤/√dV(multi-head in practice).
+===== PAGE 7 =====
+Richness-Aware Modality-Role Assignment for Multimodal EDG 7
+Fusion Output and Decoding Interface.We concatenate the dominant stream,
+its refined state, and all weighted cross-modal evidence:
+Z=
+h
+Xm⋆ ∥S m⋆ ∥ {bCm→m⋆ }m∈M¬m⋆
+i
+,(11)
+and map it back to the decoder hidden size:
+Hfus = LN(ZWfus +b fus).(12)
+To preserve textual grounding, we feed the decoder with text input embeddings
+augmented byH fus (via concatenation followed by a lightweight projection),
+rather than allowing any non-text stream to supplant the textual backbone.
+3.3 Emotion-A ware Decoding Unit
+To couple response generation with affective modeling, we attach an Emotion-
+Aware Decoding Unit to decoder hidden states and optimize it jointly with lan-
+guage modeling. Leth T ∈R H denote the decoder hidden state at the last
+response position under teacher forcing.2 We compute emotion logits:
+z(e) =W e LN(hT ) +be,p (e) = softmax(z(e)),(13)
+and define the auxiliary objective with cross-entropy:
+Lemo =−logp (e)
+h
+y(e)
+i
+.(14)
+The final training objective is
+L=L lm +L emo,(15)
+which promotes emotion-discriminative decoder representations and supports
+emotion-aligned response generation.
+4 Experiments
+4.1 Datasets
+We evaluate onMELD[7] andIEMOCAP[2], two widely used multimodal
+emotion benchmarks with aligned text, audio, and visual streams and utterance-
+level emotion labels. MELD contains 13,708 utterances from 1,433 dialogues
+annotated with 7 emotion categories, and IEMOCAP comprises about 7,433 ut-
+terances from 151 dyadic sessions with 6 commonly-used emotion categories. For
+MELD, we follow the official train/dev/test split. For IEMOCAP, we adopt the
+standard session-based protocol (Sessions 1–4 for training, Session 5 for testing)
+and hold out a validation subset from the training sessions for model selection.
+2 In our implementation,hT corresponds tolast_token_hidden_state.
+===== PAGE 8 =====
+8 M. Yu et al.
+While leave-one-session-out cross-validation is the predominant protocol in the
+ERC literature [2], we opt for a fixed split primarily for two reasons: (1) it en-
+sures a consistent comparison surface with MELD and with prior multimodal
+EDG work that also uses fixed train/test partitions [18]; and (2) IEMOCAP
+contains only five sessions, making each fold in a leave-one-out scheme a sin-
+gle session, which risks high evaluation variance on a test set of approximately
+1,500 utterances and complicates checkpoint selection under heterogeneous ses-
+sion characteristics.
+4.2 Implementation Details
+All experiments run on an NVIDIA RTX 5090 GPU. Following ERGM [18],
+audio tracks are extracted with FFmpeg (16 kHz), word-aligned via the Montreal
+ForcedAligner,andeachutteranceissegmentedintoasynchronizedaudio–visual
+clip of 32 frames. We use CLIP ViT-L/14 and HuBERT-Large as frozen visual
+and acoustic encoders, respectively. All modalities are projected to a shared
+hidden size ofH= 768via linear adapters, and multi-head attention uses 12
+heads across all fusion modules.
+For RaMRA and the ERGM baseline, both based on a decoder-only GPT-
+style backbone (12 layers, 12 heads,H= 768), we fine-tune directly on MELD
+and IEMOCAP using the Adam optimizer with a learning rate of1×10−5, a
+batch size of 16, and 10 training epochs; generation uses nucleus sampling with
+p= 0.8.ForLLM-basedsettings,weusetheQwen2.5-OmniThinkermodulewith
+a learning rate of1×10−4, feed the concatenated dialogue history as input, keep
+modality encoders frozen, and apply LoRA (r= 16,α= 32). Identical decoding
+hyperparameters are used across all LLM-based models. Other baselines (CEM,
+SEEK, CASE, IAMM) follow the hyperparameters in their original papers, and
+all baselines are reproduced using their official codebases. The ERGM baseline is
+reproduced without the guidance-text branch (which is not released) and with-
+out EmpatheticDialogues pre-training, matching the input pipeline available to
+RaMRA.
+4.3 Evaluation Metrics
+We report the following automatic metrics: perplexity (PPL) for fluency, Dist-
+1/Dist-2 [5] for response-level lexical diversity, BERTScore [26] (F1) for semantic
+similarity with the ground-truth response, and emotion accuracy (Emo Acc.),
+computed by a fixed external emotion classifier—an MLP head trained on each
+dataset’s utterance-level emotion labels following the standard ERC protocol—
+applied to the generated responses. All models are evaluated by the same ex-
+ternal classifier. We acknowledge that unweighted average recall (UAR) is often
+preferred over accuracy for imbalanced emotion datasets. However, we report
+accuracy for two reasons: (1) all baselines we compare against [9,13,27,23,18]
+use accuracy as their primary emotion metric, making it the de facto standard
+in multimodal EDG; and (2) the class distributions of both MELD (7 categories,
+4,710 train utterances) and IEMOCAP (6 categories, 5,810 train utterances) are
+===== PAGE 9 =====
+Richness-Aware Modality-Role Assignment for Multimodal EDG 9
+not severely skewed—the most and least frequent classes differ by a factor of
+approximately 3–4×, well within ranges where accuracy remains a reliable indi-
+cator. We additionally note that because all models are evaluated by thesame
+external classifier underidenticalconditions, relative ranking under accuracy
+should closely mirror that under UAR.
+Human Evaluation.We conduct a pairwise human study on 100 randomly sam-
+pled multimodal test instances from MELD and IEMOCAP (pooled for anno-
+tation). For each instance, three annotators with NLP research backgrounds
+compare two anonymized responses (order randomized) from RaMRA and the
+strongest baseline given the same multimodal inputs, and choose the better
+one underEmp(empathy/emotion alignment),Coh(contextual coherence),
+andFlu(fluency/naturalness). We report RaMRA’s win rate per criterion. For
+LLM-based human evaluation, we use the same format-only prompt at inference
+for both ERGM(Qwen) and RaMRA(Qwen).
+5 Results
+5.1 Automatic Evaluation
+T able 1.Main results on MELD and IEMOCAP. Lower is better for PPL; higher is
+better for Dist-1/2, Emo Acc., and BERTScore. Best results are inbold.
+MELD IEMOCAP
+Model PPL↓Dist-1↑Dist-2↑Emo Acc.↑BER T↑PPL↓Dist-1↑Dist-2↑Emo Acc.↑BER T↑
+Standard models
+CEM [9] 53.68 0.91 4.28 58.40 76.59 41.03 0.97 3.62 61.87 76.21
+SEEK [13] 51.44 1.01 5.38 58.95 81.01 36.52 1.12 3.81 66.40 82.01
+CASE [27] 34.02 1.10 5.81 60.48 80.73 29.51 1.16 4.11 65.94 82.44
+IAMM [23] 33.94 1.08 6.55 58.72 82.99 30.68 1.42 5.09 66.78 83.10
+ERGM [18] 27.63 1.98 9.87 66.45 84.98 22.343.1610.83 72.05 83.18
+RaMRA (Ours) 24.45 1.99 10.51 70.44 85.05 16.60 3.16 11.11 77.93 83.32
+LLM-based models
+Llama 3.2–11B 18.36 3.06 20.03 60.18 81.01 12.26 3.95 21.89 60.52 78.12
+ERGM (Qwen2.5-Omni) [20] 17.61 3.44 21.00 67.45 83.31 12.073.9922.09 63.37 80.19
+RaMRA (Qwen2.5-Omni) 16.96 3.48 22.57 68.89 86.93 10.743.9622.31 65.25 86.24
+Standard Models.As shown in Table 1, RaMRA consistently outperforms the
+strongest standard baseline ERGM on both MELD and IEMOCAP, with the
+most pronounced gains on fluency and affect alignment. On MELD, RaMRA
+reduces PPL from 27.63 to24.45and improves Emo Acc. from 66.45 to70.44,
+alongside a modest but consistent increase in BERTScore (84.98→85.05). Di-
+versity is preserved at the compositional level (Dist-2: 9.87→10.51), while Dist-
+1 remains essentially unchanged (1.98→1.99), suggesting that role-conditioned
+routing amplifies informative cross-modal cues without introducing superficial
+lexical novelty.
+===== PAGE 10 =====
+10 M. Yu et al.
+On IEMOCAP, the gains are larger and better reflect RaMRA’s motivation
+under heterogeneous modality salience: PPL drops substantially (22.34→16.60)
+and Emo Acc. increases by nearly six points (72.05→77.93). RaMRA also im-
+proves Dist-2 and BERTScore (10.83→11.11, 83.18→83.32), indicating better
+lexical composition and semantic fidelity. Dist-1 ties with ERGM (3.16 vs.3.16),
+which is consistent with our goal of controlled diversity rather than aggressive
+lexical perturbation.
+LLM-Based Models.RaMRA remains beneficial for omni-modal LLMs. Com-
+pared with ERGM (Qwen2.5-Omni [20]), RaMRA (Qwen2.5-Omni) reduces PPL
+on both MELD and IEMOCAP (17.61→16.96; 12.07→10.74) and improves
+Emo Acc. (67.45→68.89; 63.37→65.25). Notably, RaMRA yields a substan-
+tial BERTScore gain, especially on IEMOCAP (80.19→86.24), suggesting that
+modality-role routing helps the LLM internalize multimodal evidence more effec-
+tively than uniform fusion; Dist-2 also increases on both datasets (21.00→22.57;
+22.09→22.31). The tiny Dist-1 drop on IEMOCAP (3.99→3.96; absolute de-
+crease of 0.03) is negligible given RaMRA’s consistent gains in PPL, Emo Acc.,
+and BERTScore. We select Qwen2.5-Omni and Llama 3.2–11B as representative
+open-source native multimodal LLMs because they support audio, vision, and
+text as native inputs, enabling fair, reproducible comparisons under identical
+fine-tuning conditions. While Llama 3.2–11B exhibits low PPL and high diver-
+sity,itlagsbehindQwen-basedomni-modalmodelsinEmoAcc.andBERTScore,
+reinforcing that explicit audiovisual grounding is essential for affect-aware gen-
+eration.
+5.2 Human Evaluation
+T able 2.Human preference win rate (%) of RaMRA over ERGM under three cri-
+teria: Emp (empathy/emotion alignment), Coh (contextual coherence), and Flu (flu-
+ency/naturalness).
+Comparison Emp.↑Coh↑Flu↑
+RaMRA vs. ERGM 62.6 56.4 52.7
+RaMRA (Qwen) vs. ERGM (Qwen) 54.1 57.1 60.8
+Table 2 reports pairwise human preferences. Overall, RaMRA achieves higher
+win rates than ERGM across all three criteria (Emp/Coh/Flu). In the Stan-
+dard setting, RaMRA’s advantage is most pronounced on empathy alignment
+(62.6%), aligning with our motivation of amplifying the most informative affec-
+tive modality. In the LLM-based setting (Qwen2.5-Omni), the win-rate profile
+shifts: the empathy gap narrows to 54.1% while fluency becomes the main ben-
+eficiary (60.8%). We attribute this to the strong affective prior already encoded
+===== PAGE 11 =====
+Richness-Aware Modality-Role Assignment for Multimodal EDG 11
+in Qwen2.5-Omni’s large-scale multi-modal pre-training—when such an omni-
+modal LLM serves as the backbone, much of the speaker’s emotion is already
+perceivable on its own, leaving RaMRA’s role-conditioned routing to contribute
+mainly at the surface level of fluency and coherence.
+5.3 Ablation Study
+T able 3.Ablation results. MRD: Modality-Role Discriminator; RAF: Role-Aware Fu-
+sion Module; EDU: Emotion-Aware Decoding Unit. “w/o” removes the component; w/o
+MRD uses uniform role weights; w/o RAF replaces it with naive symmetric fusion; w/o
+EDU disables the auxiliary emotion supervision while keeping the rest of the pipeline
+intact. Emo Acc. is computed using a fixed external classifier on generated responses
+(independent of EDU, so Emo Acc. remains computable in all settings).
+MELD IEMOCAP
+SettingPPL↓EmoAcc.↑BERT↑PPL↓EmoAcc.↑BERT↑
+Full (RaMRA) 24.45 70.44 85.05 16.60 77.93 83.32
+w/o MRD 26.81 68.72 83.79 17.98 75.16 82.88
+w/o RAF 27.09 67.55 82.94 17.49 74.59 81.30
+w/o EDU 25.63 62.80 84.55 17.07 72.89 82.24
+Table 3 shows that each component of RaMRA is necessary for its overall
+gains. Removing the Modality-Role Discriminator (uniform roles) consistently
+degrades fluency and semantic fidelity (higher PPL and lower BERTScore), indi-
+cating the importance of instance-level role inference. Replacing role-aware rout-
+ing with naive fusion yields the largest semantic drop, especially on IEMOCAP
+(BERTScore: 83.32→81.30) with clear Emo Acc. degradation, confirming that
+dominant-modality routing is more effective than uniform aggregation. Finally,
+removing the emotion-aware unit causes the largest loss in emotion consistency
+(Emo Acc.−7.64on MELD;−5.04on IEMOCAP), suggesting auxiliary affective
+supervision is critical for emotion-aligned generation.
+6 Conclusion
+We proposeRaMRA, a framework that reframes multimodal EDG as instance-
+level modality-role assignment. By identifying a context-specific interaction hub
+and performing role-conditioned, asymmetric routing under textual grounding,
+RaMRA reduces redundant fusion and emphasizes the most reliable affective
+evidence.Thisprincipledrole-basedformulation,togetherwithauxiliaryemotion
+supervision, consistently improves emotion-aligned generation on MELD and
+IEMOCAP, demonstrating that adaptive multimodal affect perception is key to
+building emotionally intelligent dialogue systems.
+===== PAGE 12 =====
+12 M. Yu et al.
+Limitations and Future Work.While RaMRA demonstrates consistent gains,
+several limitations warrant discussion.(1) Dataset scope.Our evaluation
+is restricted to two dyadic English conversation datasets (MELD and IEMO-
+CAP); validation on larger-scale, multi-party, or multilingual benchmarks would
+strengthenthegeneralityclaim.(2) Encoder freezing.WeusefrozenCLIPand
+HuBERT encoders, following the setup in ERGM [18]. Fine-tuning the acoustic
+encoder could potentially recover more affective signal from prosody, at the cost
+of additional computational overhead.(3) Human evaluation scale.Our hu-
+man study involves 100 instances and three annotators, which is adequate for
+pairwise preference estimation but limits the statistical power for fine-grained
+per-category analysis; larger-scale annotations with more annotators would yield
+more robust subjective metrics.(4) Modality role analysis.The current work
+reportsaggregatedperformancemetricsbutdoesnotprovideabreakdownofhow
+often each modality is selected as dominant, or how role assignments correlate
+with ground-truth emotion categories.(5) Robustness to degraded inputs.
+We do not evaluate performance under missing or noisy modalities, a practical
+concern in real-world deployment. Future work will extend RaMRA along these
+axes, including per-emotion-category analysis, modality role visualizations, and
+evaluation under modality degradation scenarios.
+Disclosure of Interests.The authors have no competing interests to declare that
+are relevant to the content of this article.
+References
+1. Ai, W., Zhang, F., Shou, Y., Meng, T., Chen, H., Li, K.: Revisiting multimodal
+emotion recognition in conversation from the perspective of graph spectrum. In:
+Proceedings of the AAAI Conference on Artificial Intelligence. vol. 39, pp. 11418–
+11426 (2025). https://doi.org/10.1609/aaai.v39i11.33242
+2. Busso, C., Bulut, M., Lee, C.C., Kazemzadeh, A., Mower, E., Kim, S., Chang,
+J.N., Lee, S., Narayanan, S.S.: IEMOCAP: Interactive emotional dyadic motion
+capture database. In: Proceedings of the Sixth International Conference on Lan-
+guage Resources and Evaluation (LREC). European Language Resources Associ-
+ation (ELRA), Marrakech, Morocco (2008). https://doi.org/10.1007/s10579-008-
+9076-6
+3. Fei,H.,Zhang,H.,Wang,B.,Liao,L.,Liu,Q.,Cambria,E.:EmpathyEar:Anopen-
+source avatar multimodal empathetic chatbot. In: Proceedings of the 62nd An-
+nual Meeting of the Association for Computational Linguistics (Volume 3: System
+Demonstrations). pp. 61–71. Association for Computational Linguistics, Bangkok,
+Thailand (2024). https://doi.org/10.18653/v1/2024.acl-demos.7
+4. Feng, X., Lin, Y., He, L., Li, Y., Chang, L., Zhou, Y.: Knowledge-guided dynamic
+modality attention fusion framework for multimodal sentiment analysis. In: Find-
+ings of the Association for Computational Linguistics: EMNLP 2024. pp. 14755–
+14766. Association for Computational Linguistics, Miami, Florida, USA (2024).
+https://doi.org/10.18653/v1/2024.findings-emnlp.865
+5. Li, J., Galley, M., Brockett, C., Gao, J., Dolan, B.: A diversity-promoting ob-
+jective function for neural conversation models. In: Proceedings of the 2016
+===== PAGE 13 =====
+Richness-Aware Modality-Role Assignment for Multimodal EDG 13
+Conference of the North American Chapter of the Association for Compu-
+tational Linguistics: Human Language Technologies (NAACL-HLT). pp. 110–
+119. Association for Computational Linguistics, San Diego, California (2016).
+https://doi.org/10.18653/v1/N16-1014
+6. Liu, C., Xie, Z., Zhao, S., Zhou, J., Xu, T., Li, M., Chen, E.: Speak from
+heart: An emotion-guided LLM-based multimodal method for emotional di-
+alogue generation. In: Proceedings of the 2024 International Conference on
+Multimedia Retrieval (ICMR). pp. 533–542. ACM, Phuket, Thailand (2024).
+https://doi.org/10.1145/3652583.3658104
+7. Poria,S.,Hazarika,D.,Majumder,N.,Naik,G.,Cambria,E.,Mihalcea,R.:MELD:
+A multimodal multi-party dataset for emotion recognition in conversations. In:
+Proceedings of the 57th Annual Meeting of the Association for Computational
+Linguistics.pp.527–536.AssociationforComputationalLinguistics,Florence,Italy
+(2019). https://doi.org/10.18653/v1/P19-1050
+8. Qian, Y., Zhang, W., Liu, T.: Harnessing the power of large language mod-
+els for empathetic response generation: Empirical investigations and improve-
+ments. In: Findings of the Association for Computational Linguistics: EMNLP
+2023. pp. 6516–6528. Association for Computational Linguistics, Singapore (2023).
+https://doi.org/10.18653/v1/2023.findings-emnlp.433
+9. Sabour, S., Zheng, C., Huang, M.: CEM: Commonsense-aware empathetic re-
+sponse generation. In: Proceedings of the AAAI Conference on Artificial In-
+telligence. vol. 36, pp. 11229–11237. AAAI Press, Virtual Conference (2022).
+https://doi.org/10.1609/aaai.v36i10.21373
+10. Shi, T., Huang, S.L.: MultiEMO: An attention-based correlation-aware multimodal
+fusion framework for emotion recognition in conversations. In: Proceedings of the
+61st Annual Meeting of the Association for Computational Linguistics (Volume
+1). pp. 14752–14766. Association for Computational Linguistics, Toronto, Canada
+(2023). https://doi.org/10.18653/v1/2023.acl-long.824
+11. Tu, G., Xie, T., Liang, B., Wang, H., Xu, R.: Adaptive graph learn-
+ing for multimodal conversational emotion detection. In: Proceedings of the
+AAAI Conference on Artificial Intelligence. vol. 38, pp. 19089–19097 (2024).
+https://doi.org/10.1609/aaai.v38i17.29876
+12. Wang, H., Zhang, G., Chen, J., Li, J., Wang, Y., Guo, Y.: Empathy omni: Enabling
+empathetic speech response generation through large language models. arXiv
+preprint arXiv:2508.18655 (2025). https://doi.org/10.48550/arXiv.2508.18655
+13. Wang, L., Li, J., Lin, Z., Meng, F., Yang, C., Wang, W., Zhou, J.: Empathetic dia-
+loguegenerationviasensitiveemotionrecognitionandsensibleknowledgeselection.
+In: Findings of the Association for Computational Linguistics: EMNLP 2022. pp.
+4634–4645. Association for Computational Linguistics, Abu Dhabi, United Arab
+Emirates (2022). https://doi.org/10.18653/v1/2022.findings-emnlp.340
+14. Wang, Y., He, J., Wang, D., Wang, Q., Wan, B., Luo, X.: Multimodal transformer
+with adaptive modality weighting for multimodal sentiment analysis. Neurocom-
+puting572, 127181 (2024). https://doi.org/10.1016/j.neucom.2023.127181
+15. Weng, Z., Wu, Z., Li, H., Chen, J., Jiang, Y.G.: HCMS: Hierarchical and con-
+ditional modality selection for efficient video recognition. ACM Transactions on
+Multimedia Computing, Communications, and Applications20(2), 1–18 (2023).
+https://doi.org/10.1145/3572776
+16. Wu, C., Cai, Y., Liu, Y., Zhu, P., Xue, Y., Gong, Z., Hirschberg, J., Ma, B.:
+Multimodal emotion recognition in conversations: A survey of methods, trends,
+challenges and prospects. In: Findings of the Association for Computational Lin-
+===== PAGE 14 =====
+14 M. Yu et al.
+guistics: EMNLP 2025. pp. 6257–6274. Association for Computational Linguistics,
+Suzhou, China (2025). https://doi.org/10.18653/v1/2025.findings-emnlp.332
+17. Wu, J., Huang, X., Zhu, Z., Wang, S.: From traits to empathy: Personality-
+aware multimodal empathetic response generation. In: Proceedings of the
+31st International Conference on Computational Linguistics. pp. 8925–
+8938. Association for Computational Linguistics, Abu Dhabi, UAE (2025),
+https://aclanthology.org/2025.coling-main.598/
+18. Wu, J., Wang, S., Chang, Y., Zhu, Z.: Empathetic response generation through
+multi-modality. IEEE Transactions on Affective Computing16(4), 3614–3623
+(2025). https://doi.org/10.1109/TAFFC.2025.3599869
+19. Wu, Z., Gong, Z., Koo, J., Hirschberg, J.: Multimodal multi-loss fusion network
+for sentiment analysis. In: Proceedings of the 2024 Conference of the North Amer-
+ican Chapter of the Association for Computational Linguistics (NAACL). pp.
+3588–3602.AssociationforComputationalLinguistics,MexicoCity,Mexico(2024).
+https://doi.org/10.18653/v1/2024.naacl-long.197
+20. Xu, J., Guo, Z., He, J., Hu, H., He, T., Bai, S., Chen, K., Wang, J., Fan, Y., Dang,
+K., Zhang, B., Wang, X., Chu, Y., Lin, J.: Qwen2.5-omni technical report. arXiv
+preprint arXiv:2503.20215 (2025). https://doi.org/10.48550/arXiv.2503.20215
+21. Xue, Z., Marculescu, R.: Dynamic multimodal fusion. In: Pro-
+ceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR) Workshops. pp. 2575–2584 (2023).
+https://doi.org/10.1109/CVPRW59228.2023.00256
+22. Yan, H., Zhu, Y., Zheng, K., Liu, B., Cao, H., Jiang, D., Xu, L.: Talk with human-
+like agents: Empathetic dialogue through perceptible acoustic reception and reac-
+tion. In: Proceedings of the 62nd Annual Meeting of the Association for Computa-
+tional Linguistics (Volume 1). pp. 15009–15022. Association for Computational
+Linguistics, Bangkok, Thailand (2024). https://doi.org/10.18653/v1/2024.acl-
+long.801
+23. Yang, Z., Ren, Z., Wang, Y., Sun, H., Chen, C., Zhu, X., Liao, X.: An iterative as-
+sociative memory model for empathetic response generation. In: Proceedings of the
+62nd Annual Meeting of the Association for Computational Linguistics (Volume
+1). pp. 3081–3092. Association for Computational Linguistics, Bangkok, Thailand
+(2024). https://doi.org/10.18653/v1/2024.acl-long.170
+24. Zhang, D., Nayak, R., Bashar, M.A.: Pre-gating and contextual attention gate —
+a new fusion method for multi-modal data tasks. Neural Networks179, 106553
+(2024). https://doi.org/10.1016/j.neunet.2024.106553
+25. Zhang, H., Meng, Z., Luo, M., Han, H., Liao, L., Cambria, E., Fei, H.: Towards
+multimodalempatheticresponsegeneration:Arichtext-speech-visionavatar-based
+benchmark. In: Proceedings of the ACM Web Conference 2025. pp. 2872–2881.
+ACM, Sydney, Australia (2025). https://doi.org/10.1145/3696410.3714739
+26. Zhang, T., Kishore, V., Wu, F., Weinberger, K.Q., Artzi, Y.: BERTScore: Evaluat-
+ingtextgenerationwithBERT.In:Proceedingsofthe8thInternationalConference
+on Learning Representations. OpenReview.net, Addis Ababa, Ethiopia (2020)
+27. Zhou, J., Zheng, C., Wang, B., Zhang, Z., Huang, M.: CASE: Aligning coarse-to-
+fine cognition and affection for empathetic response generation. In: Proceedings of
+the 61st Annual Meeting of the Association for Computational Linguistics (Volume
+1). pp. 8223–8237. Association for Computational Linguistics, Toronto, Canada
+(2023). https://doi.org/10.18653/v1/2023.acl-long.457

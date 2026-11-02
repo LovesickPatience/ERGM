@@ -62,14 +62,18 @@ def _iter_dialogues(diadict: Dict[str, Any], session_filter: Optional[str]):
         yield dlg_id, utts
 
 
-def _rolling_pairs(utterances: List[Dict[str, Any]]):
-    """Yield (context_utts, label_utt) using rolling concatenation ut0→ut1, (ut0+ut1)→ut2, ..."""
+def _rolling_pairs(utterances: List[Dict[str, Any]], max_turns: Optional[int] = None):
+    """Yield (context_utts, label_utt) using rolling concatenation ut0→ut1, (ut0+ut1)→ut2, ...
+
+    max_turns: 只保留最近 max_turns 句作为上下文（滑动窗口）；None 表示不限制。
+    """
     ctx = []
     for i, u in enumerate(utterances):
         if i == 0:
             ctx.append(u)
             continue
-        yield list(ctx), u
+        window = ctx[-max_turns:] if (max_turns and max_turns > 0) else list(ctx)
+        yield window, u
         ctx.append(u)
 
 
@@ -96,7 +100,8 @@ def _concat_text_and_boundaries(
     cursor = len(text)  # current length of text
 
     for i, u in enumerate(utts):
-        utext = u.get("text", "")
+        # 去掉原文首尾空白，避免出现 "<sp1>  Why"（两个空格）这种多余 token
+        utext = (u.get("text") or "").strip()
         sp_tok = speaker_tokens[i] if (speaker_tokens is not None and i < len(speaker_tokens)) else ""
         spacer = (" " if (insert_space_after_sp and sp_tok) else "")
 
@@ -243,7 +248,8 @@ class IEMOCAPDialoguePKLDataset(Dataset):
     SPLIT_INDEX = {"train":0, "test":2, "val":1}
 
     def __init__(self, json_path: str, pkl_path: str, split: str = "train", session_filter: Optional[str] = None,
-                 bos: str = None, eos: str = "</s>", sp1_token: str = "<sp1>", sp2_token: str = "<sp2>"):
+                 bos: str = None, eos: str = "</s>", sp1_token: str = "<sp1>", sp2_token: str = "<sp2>",
+                 max_turns: Optional[int] = None):
         super().__init__()
         self.meta = _load_json(json_path)
         with open(pkl_path, "rb") as f:
@@ -251,6 +257,8 @@ class IEMOCAPDialoguePKLDataset(Dataset):
         si = self.SPLIT_INDEX[split]
         self.audio_bank: Dict[str, Any] = blob["audio"][si]
         self.video_bank: Dict[str, Any] = blob["video"][si]
+        self.max_turns = max_turns
+        self.modal_dim = self._infer_modal_dim()
         # Restrict to utterances that belong to the requested split (keys come from the pre-split A/V banks)
         # Otherwise train/val/test will see the same text dialogues.
         allowed_utt_ids = set(self.audio_bank.keys()) | set(self.video_bank.keys())
@@ -280,7 +288,7 @@ class IEMOCAPDialoguePKLDataset(Dataset):
             if len(utts) < 2:
                 continue
             utts = sorted(utts, key=lambda u: float(u.get("start_time", 0.0)))
-            for ctx_utts, label_utt in _rolling_pairs(utts):
+            for ctx_utts, label_utt in _rolling_pairs(utts, self.max_turns):
                 # speakers for context and label (build tokens/ids first)
                 ctx_speakers = [u.get("speaker", "UNK") for u in ctx_utts]
                 ctx_sp_ids, ctx_sp_toks = zip(*[_sp_id_and_token(s) for s in ctx_speakers]) if ctx_speakers else ([], [])
@@ -294,26 +302,13 @@ class IEMOCAPDialoguePKLDataset(Dataset):
                 label_speaker_id, label_speaker_token = _sp_id_and_token(label_speaker)
                 # collect context utterance ids
                 ctx_ids = [u.get("utterance_id") for u in ctx_utts]
-                # A/V features list
-                a_feats, v_feats = [], []
-                for uid in ctx_ids:
-                    if uid in self.audio_bank:
-                        a = self.audio_bank[uid]
-                        a = torch.tensor(a)
-                        if a.ndim == 1:
-                            a = a.unsqueeze(0)
-                        a = a.mean(dim=0)  # time-pool to (D,)
-                        a_feats.append(a)
-                    if uid in self.video_bank:
-                        v = self.video_bank[uid]
-                        v = torch.tensor(v)
-                        if v.ndim == 1:
-                            v = v.unsqueeze(0)
-                        v = v.mean(dim=0)
-                        v_feats.append(v)
+                # A/V features: 与 ctx_utts **逐句对齐**（缺失的句子补 0 向量），
+                # 这样下游 collate 才能把"每句话的特征"贴到"这句话的 token"上。
+                a_rows = [self._pool_from_bank(self.audio_bank, uid) for uid in ctx_ids]
+                v_rows = [self._pool_from_bank(self.video_bank, uid) for uid in ctx_ids]
                 # stack to (Lc, D)
-                a_stack = torch.stack(a_feats, dim=0) if a_feats else torch.zeros(1, 64)
-                v_stack = torch.stack(v_feats, dim=0) if v_feats else torch.zeros(1, 64)
+                a_stack = torch.stack(a_rows, dim=0) if a_rows else torch.zeros(1, self.modal_dim)
+                v_stack = torch.stack(v_rows, dim=0) if v_rows else torch.zeros(1, self.modal_dim)
 
                 self.samples.append({
                     "dialogue_id": dlg_id,
@@ -332,9 +327,11 @@ class IEMOCAPDialoguePKLDataset(Dataset):
                     "label_speaker_token": label_speaker_token,
                     "speaker_map": {k: (v[0], v[1]) for k, v in sp_map.items()},
 
-                    # 多模态特征（上下文拼接为 (Lc, D)）
+                    # 多模态特征（上下文拼接为 (Lc, D)，行顺序 = ctx_utt_texts 顺序）
                     "audio_feats": a_stack,
                     "video_feats": v_stack,
+                    "ctx_audio": a_stack,
+                    "ctx_video": v_stack,
 
                     # 标签文本/情感
                     "erc_label_text": label_utt.get("emo", "neu"),
@@ -344,6 +341,29 @@ class IEMOCAPDialoguePKLDataset(Dataset):
                     "cause_true_utt_ids": label_utt.get("hist_utt_id", []) or label_utt.get("emtion_cause_utterance_id",
                                                                                             []),
                 })
+
+    def _infer_modal_dim(self, default: int = 64) -> int:
+        """从特征库里推断单帧/单句特征维度。"""
+        for bank in (self.audio_bank, self.video_bank):
+            try:
+                for v in bank.values():
+                    t = v if torch.is_tensor(v) else torch.tensor(v)
+                    if t.numel() > 0:
+                        return int(t.shape[-1])
+            except Exception:
+                continue
+        return default
+
+    def _pool_from_bank(self, bank: Dict[str, Any], uid: str) -> torch.Tensor:
+        """取单句特征并在时间维做均值池化 -> (D,)；缺失则返回全 0 向量。"""
+        feat = bank.get(uid) if hasattr(bank, "get") else None
+        if feat is None:
+            return torch.zeros(self.modal_dim, dtype=torch.float32)
+        t = feat if torch.is_tensor(feat) else torch.tensor(feat)
+        t = t.to(torch.float32)
+        if t.dim() == 1:
+            return t
+        return t.reshape(-1, t.shape[-1]).mean(dim=0)
 
     def __len__(self):
         return len(self.samples)

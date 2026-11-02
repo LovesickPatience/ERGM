@@ -1,0 +1,20 @@
+{
+  "python.defaultInterpreterPath": "D:\\Anaconda\\Anaconda3\\envs\\ergm\\python.exe",
+  "python.terminal.activateEnvironment": true,
+  "terminal.integrated.env.windows": {
+    "PYTHONPATH": "${workspaceFolder}"
+  },
+  "terminal.integrated.profiles.windows": {
+    "PowerShell (ergm)": {
+      "source": "PowerShell",
+      "args": [
+        "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& 'D:\\Anaconda\\Anaconda3\\shell\\condabin\\conda-hook.ps1' ; conda activate ergm"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "PowerShell (ergm)"
+}

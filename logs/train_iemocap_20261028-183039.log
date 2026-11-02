@@ -1,0 +1,36 @@
+==============================================================================================================
+RaMRA training run   start = 20261028-183039
+dataset          : IEMOCAP
+model_type       : E:/code/ERGM/ERGM/models/gpt2
+lr / batch / ep  : 1e-05 / 2 / 15   (new_module_lr=0.001, grad_clip=1.0)
+max_len / turns  : 1024 / 10
+tau              : None
+selector         : hidden=768 layers=2 dropout=0.1
+train_pkls       : E:\code\ERGM\ERGM\data\iemocap\iemocap_data_0610.pkl
+val_pkls         : E:\code\ERGM\ERGM\data\iemocap\iemocap_data_0610.pkl
+ckpt_dir         : E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap
+==============================================================================================================
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=1_valid_ppl=36.2603_val_emo_acc=42.57%_20261028-183437_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 18:34:38] epoch 1/15  elapsed=4.0min | train: loss=6.4370 ppl=104.3221 emo=29.06% | valid: loss=4.9429 ppl=36.2603 emo=42.57% | best_val_ppl=36.2603  <== NEW BEST | train α=[0.886,0.033,0.081] main(T/A/V)=4581/37/602 | val α=[0.997,0.003,0.001] α_std=0.0006 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=2_valid_ppl=25.3151_val_emo_acc=38.81%_20261028-183825_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 18:38:26] epoch 2/15  elapsed=7.8min | train: loss=4.9652 ppl=35.8085 emo=46.86% | valid: loss=4.8754 ppl=25.3151 emo=38.81% | best_val_ppl=25.3151  <== NEW BEST | train α=[0.998,0.002,0.000] main(T/A/V)=5218/2/0 | val α=[1.000,0.000,0.000] α_std=0.0000 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=3_valid_ppl=19.8536_val_emo_acc=39.41%_20261028-184207_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 18:42:08] epoch 3/15  elapsed=11.5min | train: loss=4.2273 ppl=22.2687 emo=57.39% | valid: loss=4.5633 ppl=19.8536 emo=39.41% | best_val_ppl=19.8536  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0000 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=4_valid_ppl=18.9583_val_emo_acc=55.84%_20261028-184552_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 18:45:53] epoch 4/15  elapsed=15.2min | train: loss=3.7590 ppl=16.6820 emo=62.97% | valid: loss=4.2465 ppl=18.9583 emo=55.84% | best_val_ppl=18.9583  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0000 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=5_valid_ppl=16.9987_val_emo_acc=57.43%_20261028-184942_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 18:49:44] epoch 5/15  elapsed=19.1min | train: loss=3.4477 ppl=14.2842 emo=70.42% | valid: loss=4.0784 ppl=16.9987 emo=57.43% | best_val_ppl=16.9987  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0000 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=6_valid_ppl=16.5062_val_emo_acc=56.44%_20261028-185331_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 18:53:33] epoch 6/15  elapsed=22.9min | train: loss=3.1758 ppl=12.6295 emo=75.44% | valid: loss=4.1785 ppl=16.5062 emo=56.44% | best_val_ppl=16.5062  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0000 main(T/A/V)=505/0/0
+[2026-10-28 18:57:21] epoch 7/15  elapsed=26.7min | train: loss=2.9780 ppl=11.6461 emo=80.52% | valid: loss=4.3560 ppl=16.5445 emo=58.02% | best_val_ppl=16.5062 | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0005 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=8_valid_ppl=16.2478_val_emo_acc=57.03%_20261028-190108_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:01:10] epoch 8/15  elapsed=30.5min | train: loss=2.8000 ppl=10.8657 emo=84.50% | valid: loss=4.4536 ppl=16.2478 emo=57.03% | best_val_ppl=16.2478  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0003 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=9_valid_ppl=16.1514_val_emo_acc=56.83%_20261028-190457_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:04:59] epoch 9/15  elapsed=34.3min | train: loss=2.6636 ppl=10.1869 emo=87.45% | valid: loss=4.4728 ppl=16.1514 emo=56.83% | best_val_ppl=16.1514  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0001 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=10_valid_ppl=16.0433_val_emo_acc=58.22%_20261028-190843_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:08:44] epoch 10/15  elapsed=38.1min | train: loss=2.5783 ppl=9.8227 emo=89.00% | valid: loss=4.5016 ppl=16.0433 emo=58.22% | best_val_ppl=16.0433  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0003 main(T/A/V)=505/0/0
+[2026-10-28 19:12:28] epoch 11/15  elapsed=41.8min | train: loss=2.4850 ppl=9.5093 emo=91.55% | valid: loss=4.6607 ppl=16.0609 emo=58.42% | best_val_ppl=16.0433 | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0000 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=12_valid_ppl=16.0077_val_emo_acc=58.22%_20261028-191609_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:16:11] epoch 12/15  elapsed=45.5min | train: loss=2.4429 ppl=9.3293 emo=92.28% | valid: loss=4.7194 ppl=16.0077 emo=58.22% | best_val_ppl=16.0077  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0000 main(T/A/V)=505/0/0
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v2\gpt2\iemocap\best_ckpt_epoch=13_valid_ppl=16.0070_val_emo_acc=58.22%_20261028-191957_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:19:58] epoch 13/15  elapsed=49.3min | train: loss=2.4121 ppl=9.1629 emo=93.08% | valid: loss=4.7692 ppl=16.0070 emo=58.22% | best_val_ppl=16.0070  <== NEW BEST | train α=[1.000,0.000,0.000] main(T/A/V)=5220/0/0 | val α=[1.000,0.000,0.000] α_std=0.0000 main(T/A/V)=505/0/0

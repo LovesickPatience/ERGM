@@ -1,0 +1,54 @@
+Loading the tokenizer...
+Loading the model...
+Loading train & valid data...
+Loading the optimizer...
+  param groups: backbone=152.8M @lr=1e-05 | new modules=14.0M @lr=0.001
+Setting finished.
+Training starts.
+==============================================================================================================
+RaMRA training run   start = 20261028-192543
+dataset          : IEMOCAP
+model_type       : E:/code/ERGM/ERGM/models/gpt2
+lr / batch / ep  : 1e-05 / 2 / 15   (new_module_lr=0.001, grad_clip=1.0)
+max_len / turns  : 1024 / 10
+tau              : None
+selector         : hidden=768 layers=2 dropout=0.1
+richness (A+C)   : lam=0.1 tau_r=0.5 smooth=0.1 aux_floor=0.05 every=1
+ckpt_dir         : E:\code\ERGM\ERGM\saved_models_v3\gpt2\iemocap
+==============================================================================================================
+-----------------------------------Epoch: 1-----------------------------------
+Train Loss: 6.5405 | Train PPL: 106.8461 | Train Emotion Acc: 29.77%
+Validation processing...
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v3\gpt2\iemocap\best_ckpt_epoch=1_valid_ppl=37.0935_val_emo_acc=45.35%_20261028-193148_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:31:49] epoch 1/15  elapsed=6.1min | train loss=6.5405 ppl=106.8461 | valid ppl=37.0935  <== NEW BEST | α_train=[0.54,0.23,0.22] main=4573/402/245 rich_kl=1.0401 | α_val=[0.56,0.22,0.22] std=0.046 main=505/0/0
+Best valid PPL: 37.0935
+Current valid loss: 5.0180 | Current valid PPL: 37.0935 | Current valid Emotion Acc: 45.35%
+-----------------------------------Epoch: 2-----------------------------------
+Train Loss: 5.2058 | Train PPL: 37.9487 | Train Emotion Acc: 42.76%
+Validation processing...
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v3\gpt2\iemocap\best_ckpt_epoch=2_valid_ppl=20.4992_val_emo_acc=43.96%_20261028-193730_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:37:31] epoch 2/15  elapsed=11.8min | train loss=5.2058 ppl=37.9487 | valid ppl=20.4992  <== NEW BEST | α_train=[0.63,0.16,0.21] main=5076/65/79 rich_kl=0.9511 | α_val=[0.63,0.18,0.19] std=0.025 main=505/0/0
+Best valid PPL: 20.4992
+Current valid loss: 4.3106 | Current valid PPL: 20.4992 | Current valid Emotion Acc: 43.96%
+-----------------------------------Epoch: 3-----------------------------------
+Train Loss: 4.2237 | Train PPL: 18.4632 | Train Emotion Acc: 52.22%
+Validation processing...
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v3\gpt2\iemocap\best_ckpt_epoch=3_valid_ppl=15.0470_val_emo_acc=41.78%_20261028-194311_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:43:13] epoch 3/15  elapsed=17.5min | train loss=4.2237 ppl=18.4632 | valid ppl=15.0470  <== NEW BEST | α_train=[0.72,0.16,0.12] main=5200/10/10 rich_kl=0.8040 | α_val=[0.76,0.14,0.10] std=0.026 main=505/0/0
+Best valid PPL: 15.0470
+Current valid loss: 4.1983 | Current valid PPL: 15.0470 | Current valid Emotion Acc: 41.78%
+-----------------------------------Epoch: 4-----------------------------------
+Train Loss: 3.6514 | Train PPL: 12.5421 | Train Emotion Acc: 59.54%
+Validation processing...
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v3\gpt2\iemocap\best_ckpt_epoch=4_valid_ppl=13.3441_val_emo_acc=55.64%_20261028-194859_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:49:00] epoch 4/15  elapsed=23.3min | train loss=3.6514 ppl=12.5421 | valid ppl=13.3441  <== NEW BEST | α_train=[0.78,0.14,0.09] main=5219/1/0 rich_kl=0.6826 | α_val=[0.85,0.08,0.07] std=0.015 main=505/0/0
+Best valid PPL: 13.3441
+Current valid loss: 3.8552 | Current valid PPL: 13.3441 | Current valid Emotion Acc: 55.64%
+-----------------------------------Epoch: 5-----------------------------------
+Train Loss: 3.3087 | Train PPL: 10.3000 | Train Emotion Acc: 65.00%
+Validation processing...
+    [ckpt] saved E:\code\ERGM\ERGM\saved_models_v3\gpt2\iemocap\best_ckpt_epoch=5_valid_ppl=12.3289_val_emo_acc=50.89%_20261028-195442_text+imgs+auds.ckpt  (1.78 GB)
+[2026-10-28 19:54:43] epoch 5/15  elapsed=29.0min | train loss=3.3087 ppl=10.3000 | valid ppl=12.3289  <== NEW BEST | α_train=[0.81,0.12,0.07] main=5220/0/0 rich_kl=0.6241 | α_val=[0.84,0.08,0.08] std=0.012 main=505/0/0
+Best valid PPL: 12.3289
+Current valid loss: 3.8306 | Current valid PPL: 12.3289 | Current valid Emotion Acc: 50.89%
+-----------------------------------Epoch: 6-----------------------------------

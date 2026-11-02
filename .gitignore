@@ -1,0 +1,23 @@
+# ---------- 大体积本地文件（不进 git） ----------
+
+# 预训练权重目录（gpt2 / roberta 等）
+/models/
+
+# 训练产出的 checkpoint（单个约 1.7GB，超过 GitHub 100MB 限制）
+/saved_models*/**/*.ckpt
+
+# 原始/派生数据集：pkl 达 637MB，超过 GitHub 单文件 100MB 硬限制
+# 需要共享请使用 Git LFS 或网盘
+data/**/*.pkl
+data/**/*.pt
+data/**/*.npz
+
+# ---------- Python 缓存 ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---------- 编辑器 / 系统 ----------
+Thumbs.db
+.DS_Store

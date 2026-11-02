@@ -89,12 +89,19 @@ class Manager:
         self.args.sp2_id = vocab[self.args.sp2_token]
         self.args.img_id = self.tokenizer.convert_tokens_to_ids("<img>")
         self.args.aud_id = self.tokenizer.convert_tokens_to_ids("<aud>")
+        # 用 <bos> 作为 padding id：IEMOCAP 上下文里从不出现该 token，
+        # 因此 attention_mask 可以直接由 (input_ids != pad_id) 得到，且不会误伤真正的 </s>
+        self.args.pad_id = self.args.bos_id
+        # RaMRA 用融合模块注入模态，不需要 <img>/<aud> 两个占位 token（它们只是随机 embedding 噪声）
+        self.args.emit_placeholders = False
 
         print("Loading the model...")
         self.fix_seed(self.args.seed)
         self.model = GPT2LMHeadModel.from_pretrained(self.args.model_type).to(self.args.device)
         self.model.config.img_id = self.args.img_id
         self.model.config.aud_id = self.args.aud_id
+        # 辅助模态权重的下限（方案 A：辅助权重在辅助集合内归一化 + 地板，避免被 α 清零）
+        self.model.config.aux_floor = float(getattr(self.args, 'aux_floor', 0.05))
         self.model.resize_token_embeddings(self.args.final_vocab_size)
         self.args.max_len = min(self.args.max_len, self.model.config.n_ctx)
 
@@ -118,9 +125,11 @@ class Manager:
                         if isinstance(self.args.val_pkls, str) else self.args.val_pkls
 
                     train_set = IEMOCAPDialoguePKLDataset(pkl_path=train_pkl_list[0],
-                                                          json_path=self.args.iemocap_text_json, split='train')
+                                                          json_path=self.args.iemocap_text_json, split='train',
+                                                          max_turns=self.args.max_turns)
                     valid_set = IEMOCAPDialoguePKLDataset(pkl_path=val_pkl_list[0],
-                                                          json_path=self.args.iemocap_text_json, split='val')
+                                                          json_path=self.args.iemocap_text_json, split='val',
+                                                          max_turns=self.args.max_turns)
                 elif args.mode == 'infer':
                     val_pkl_list = [p.strip() for p in self.args.val_pkls.split(',')] \
                         if isinstance(self.args.val_pkls, str) else self.args.val_pkls
@@ -128,9 +137,11 @@ class Manager:
                         if isinstance(self.args.val_pkls, str) else self.args.val_pkls
 
                     valid_set = IEMOCAPDialoguePKLDataset(pkl_path=val_pkl_list[0],
-                                                          json_path=self.args.iemocap_text_json, split='val')
+                                                          json_path=self.args.iemocap_text_json, split='val',
+                                                          max_turns=self.args.max_turns)
                     test_set = IEMOCAPDialoguePKLDataset(pkl_path=test_pkl_list[0],
-                                                         json_path=self.args.iemocap_text_json, split='test')
+                                                         json_path=self.args.iemocap_text_json, split='test',
+                                                         max_turns=self.args.max_turns)
 
                 collate = ppd.iemocap_collate(self.tokenizer)
                 if args.mode == 'train':
@@ -220,8 +231,32 @@ class Manager:
             self._init_selector()
 
             print("Loading the optimizer...")
-            params = list(self.model.parameters()) + list(self.selector.parameters())
-            self.optim = torch.optim.AdamW(params, lr=self.args.lr)
+            # 参数分组：主干用 args.lr；新初始化的模块（融合层 / 情感头 / selector）用更大的 lr，
+            # 否则它们和预训练主干共用 1e-5，几乎学不动（α 会塌缩成一个常数偏置）。
+            tr = getattr(self.model, "transformer", None)
+            new_modules = []
+            for name in ("aud_proj", "img_proj", "fus_proj", "ln_fus", "aug_proj", "mha_self", "mha_cross"):
+                mod = getattr(tr, name, None) if tr is not None else None
+                if mod is not None:
+                    new_modules.append(mod)
+            if getattr(self.model, "emotion_head", None) is not None:
+                new_modules.append(self.model.emotion_head)
+            new_ids = {id(p) for m in new_modules for p in m.parameters()}
+
+            base_params = [p for p in self.model.parameters() if id(p) not in new_ids]
+            new_params = [p for p in self.model.parameters() if id(p) in new_ids]
+            new_params += list(self.selector.parameters())
+
+            self._all_params = base_params + new_params
+            self.optim = torch.optim.AdamW(
+                [
+                    {"params": base_params, "lr": self.args.lr},
+                    {"params": new_params, "lr": self.args.new_module_lr},
+                ],
+                lr=self.args.lr,
+            )
+            print(f"  param groups: backbone={sum(p.numel() for p in base_params) / 1e6:.1f}M @lr={self.args.lr}"
+                  f" | new modules={sum(p.numel() for p in new_params) / 1e6:.1f}M @lr={self.args.new_module_lr}")
 
             if args.mode == 'train':
                 num_batches = len(self.train_loader)
@@ -286,10 +321,58 @@ class Manager:
 
         print("Setting finished.")
 
+    def _init_train_log(self):
+        """创建本次训练的日志文件：文件名带启动时间戳，本次训练的所有 epoch 写在同一个文件里。
+
+        日志固定写到 <仓库根>/logs/ 下（用 __file__ 定位，不受启动时工作目录影响）。
+        """
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        self.train_log_path = os.path.join(log_dir, f"train_{str(self.args.dataset).lower()}_{ts}.log")
+        self._train_log_fp = open(self.train_log_path, "a", encoding="utf-8")
+        self._train_start_time = time.time()
+        header = [
+            "=" * 110,
+            f"RaMRA training run   start = {ts}",
+            f"dataset          : {self.args.dataset}",
+            f"model_type       : {self.args.model_type}",
+            f"lr / batch / ep  : {self.args.lr} / {self.args.batch_size} / {self.args.num_epochs}"
+            f"   (new_module_lr={getattr(self.args, 'new_module_lr', None)},"
+            f" grad_clip={getattr(self.args, 'grad_clip', None)})",
+            f"max_len / turns  : {self.args.max_len} / {getattr(self.args, 'max_turns', None)}",
+            f"tau              : {getattr(self.args, 'tau', None)}",
+            f"selector         : hidden={self.args.selector_hidden_dim} "
+            f"layers={self.args.selector_num_layers} dropout={self.args.selector_dropout}",
+            f"richness (A+C)   : lam={self.args.richness_lambda} tau_r={self.args.richness_tau} "
+            f"smooth={self.args.richness_smooth} aux_floor={self.args.aux_floor} "
+            f"every={self.args.richness_every}",
+            f"ckpt_dir         : {self.args.ckpt_dir}",
+            "=" * 110,
+        ]
+        for line in header:
+            self._log(line)
+
+    def _log(self, msg):
+        """同时打印到控制台并写入本次训练日志。"""
+        print(msg)
+        fp = getattr(self, "_train_log_fp", None)
+        if fp is not None:
+            fp.write(msg + "\n")
+            fp.flush()
+
+    def _close_train_log(self):
+        fp = getattr(self, "_train_log_fp", None)
+        if fp is not None:
+            fp.close()
+            self._train_log_fp = None
+
     def train(self):
         self.fix_seed(self.args.seed)
         print("Training starts.")
         start_epoch = self.last_epoch + 1
+        self._init_train_log()
+        global_step = 0
 
         for epoch in range(start_epoch, start_epoch + self.args.num_epochs):
             self.model.train()
@@ -301,6 +384,12 @@ class Manager:
             train_lm_losses = []  # For PPL calculation
             train_correct_emotions = 0
             train_total_emotions = 0
+            # 训练期 α 统计（用于判断 MRD 是否真的在分化）
+            tr_alpha_sum = torch.zeros(3)
+            tr_main_counts = torch.zeros(3, dtype=torch.long)
+            tr_n = 0
+            tr_kl_sum = 0.0
+            tr_kl_n = 0
 
             for i, batch in enumerate(tqdm(self.train_loader)):
                 input_ids, token_type_ids, lm_labels, imgs, auds, contexts, emotion_labels = batch
@@ -311,11 +400,22 @@ class Manager:
                     lm_labels.to(self.args.device),
                     torch.LongTensor(emotion_labels).to(self.args.device),  # Ensure emotion labels are tensors
                 )
+                # 融合模块需要 imgs/auds 与模型同设备
+                imgs = imgs.to(self.args.device, dtype=torch.float32) if imgs is not None else None
+                auds = auds.to(self.args.device, dtype=torch.float32) if auds is not None else None
 
                 gated_weight, main_idx = self._selector_forward(input_ids, imgs, auds)
 
+                if gated_weight is not None:
+                    with torch.no_grad():
+                        tr_alpha_sum += gated_weight.detach().float().sum(dim=0).cpu()
+                        tr_main_counts += torch.bincount(
+                            main_idx.detach().view(-1).cpu(), minlength=3)[:3]
+                        tr_n += int(gated_weight.size(0))
+
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
+                    attention_mask=self._attn_mask(input_ids),
                     labels=lm_labels, emotion_labels=emotion_labels,
                     imgs=imgs,
                     auds=auds,
@@ -324,16 +424,31 @@ class Manager:
                 )
 
                 loss = outputs.loss
+                # ---- 方案 C：richness 监督，让 α 对齐"模态边际贡献" ----
+                if (self.args.richness_lambda > 0 and gated_weight is not None
+                        and (global_step % max(1, self.args.richness_every) == 0)):
+                    warm = max(1, int(self.args.richness_warmup_steps))
+                    lam = self.args.richness_lambda * min(1.0, global_step / warm)
+                    if lam > 0:
+                        rich = self._richness_kl(input_ids, token_type_ids, lm_labels, emotion_labels,
+                                                 imgs, auds, gated_weight, main_idx, base_out=outputs)
+                        loss = loss + lam * rich
+                        tr_kl_sum += float(rich.detach())
+                        tr_kl_n += 1
+                global_step += 1
+
                 self.optim.zero_grad()
                 loss.backward()
+                # 梯度裁剪：新模块用了更大的 lr，融合 attention 容易爆梯度
+                if getattr(self.args, "grad_clip", 0) and self.args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self._all_params, self.args.grad_clip)
                 self.optim.step()
                 self.sched.step()
 
                 train_total_losses.append(loss.item())
 
                 with torch.no_grad():
-                    shift_logits = outputs.logits[..., :-1, :].contiguous()
-                    shift_labels = lm_labels[..., 1:].contiguous()
+                    shift_logits, shift_labels = self._shift_for_lm(outputs.logits, lm_labels)
                     loss_fct_lm = nn.CrossEntropyLoss()
                     lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                     train_lm_losses.append(lm_loss.item())
@@ -353,10 +468,20 @@ class Manager:
             # self.writer.add_scalar("PPL/train", train_ppl, epoch)
             # self.writer.add_scalar("Accuracy/train", train_acc, epoch)
 
+            tr_alpha_txt = ""
+            if tr_n > 0:
+                tr_alpha = tr_alpha_sum / tr_n
+                tr_alpha_txt = (f" | α_train=[{tr_alpha[0]:.2f},{tr_alpha[1]:.2f},{tr_alpha[2]:.2f}]"
+                                f" main={int(tr_main_counts[0])}/{int(tr_main_counts[1])}/{int(tr_main_counts[2])}")
+            if tr_kl_n > 0:
+                tr_alpha_txt += f" rich_kl={tr_kl_sum / tr_kl_n:.4f}"
+
             self.last_epoch += 1
             valid_loss, valid_ppl, valid_acc = self.validation()
 
-            if valid_ppl < self.best_ppl:
+            # ---- 每个 epoch 的训练/验证结果写入日志（同一文件，逐行追加）----
+            is_best = valid_ppl < self.best_ppl
+            if is_best:
                 self.best_ppl = valid_ppl
                 state_dict = {
                     "model_state_dict": self.model.state_dict(),
@@ -371,9 +496,33 @@ class Manager:
                     self.args.ckpt_dir,
                     f"best_ckpt_epoch={epoch}_valid_ppl={self.best_ppl:.4f}_val_emo_acc={valid_acc:.2f}%_{now}_text+imgs+auds.ckpt",
                 )
-                torch.save(state_dict, save_path)
-                print("*" * 10 + " Current best checkpoint is saved. " + "*" * 10)
-                print(save_path)
+                # 先写临时文件再原子改名：中途被打断或磁盘写满也不会留下损坏的 ckpt
+                tmp_path = save_path + ".tmp"
+                try:
+                    torch.save(state_dict, tmp_path)
+                    os.replace(tmp_path, save_path)
+                    self._log(f"    [ckpt] saved {save_path}  ({os.path.getsize(save_path) / 1e9:.2f} GB)")
+                except Exception as e:
+                    self._log(f"    [ckpt][ERROR] 保存失败: {e}")
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+
+            va = getattr(self, "_val_alpha_stats", None)
+            va_txt = ""
+            if va is not None and va["n"] > 0:
+                va_txt = (f" | α_val=[{va['alpha'][0]:.2f},{va['alpha'][1]:.2f},{va['alpha'][2]:.2f}]"
+                          f" std={va['std']:.3f} main={va['main'][0]}/{va['main'][1]}/{va['main'][2]}")
+            elapsed_min = (time.time() - self._train_start_time) / 60.0
+            self._log(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] epoch {epoch}/{start_epoch + self.args.num_epochs - 1}"
+                f"  elapsed={elapsed_min:.1f}min"
+                f" | train loss={avg_train_loss:.4f} ppl={train_ppl:.4f}"
+                f" | valid ppl={valid_ppl:.4f}{'  <== NEW BEST' if is_best else ''}"
+                f"{tr_alpha_txt}{va_txt}"
+            )
 
             print(f"Best valid PPL: {self.best_ppl:.4f}")
             print(
@@ -383,6 +532,9 @@ class Manager:
             # self.writer.add_scalar("Accuracy/valid", valid_acc, epoch)
 
         print("Training finished!")
+        self._log(f"Training finished. best valid PPL = {self.best_ppl:.4f}")
+        self._log(f"log file: {getattr(self, 'train_log_path', None)}")
+        self._close_train_log()
 
     def validation(self):
         print("Validation processing...")
@@ -395,6 +547,12 @@ class Manager:
         valid_correct_emotions = 0
         valid_total_emotions = 0
 
+        # 验证期 α 统计（均值 / 标准差 / 主模态分布），用于判断 MRD 是否在分化
+        va_alpha_sum = torch.zeros(3)
+        va_alpha_sq = torch.zeros(3)
+        va_main_counts = torch.zeros(3, dtype=torch.long)
+        va_n = 0
+
         with torch.no_grad():
             for i, batch in enumerate(tqdm(self.valid_loader)):
                 input_ids, token_type_ids, lm_labels, imgs, auds, contexts, emotion_labels = batch
@@ -405,11 +563,22 @@ class Manager:
                     lm_labels.to(self.args.device),
                     torch.LongTensor(emotion_labels).to(self.args.device),
                 )
+                imgs = imgs.to(self.args.device, dtype=torch.float32) if imgs is not None else None
+                auds = auds.to(self.args.device, dtype=torch.float32) if auds is not None else None
 
                 gate, main_idx = self._selector_forward(input_ids, imgs, auds)
 
+                if gate is not None:
+                    g = gate.detach().float().cpu()
+                    va_alpha_sum += g.sum(dim=0)
+                    va_alpha_sq += (g ** 2).sum(dim=0)
+                    va_main_counts += torch.bincount(
+                        main_idx.detach().view(-1).cpu(), minlength=3)[:3]
+                    va_n += int(g.size(0))
+
                 outputs = self.model(
                     input_ids=input_ids, token_type_ids=token_type_ids,
+                    attention_mask=self._attn_mask(input_ids),
                     labels=lm_labels, emotion_labels=emotion_labels,
                     imgs=imgs,
                     auds=auds,
@@ -419,8 +588,7 @@ class Manager:
 
                 valid_total_losses.append(outputs.loss.item())
 
-                shift_logits = outputs.logits[..., :-1, :].contiguous()
-                shift_labels = lm_labels[..., 1:].contiguous()
+                shift_logits, shift_labels = self._shift_for_lm(outputs.logits, lm_labels)
                 loss_fct_lm = nn.CrossEntropyLoss()
                 lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 valid_lm_losses.append(lm_loss.item())
@@ -437,13 +605,37 @@ class Manager:
         if math.isnan(valid_ppl):
             valid_ppl = 1e8
 
+        # ---- α 统计（供 train() 写入日志）----
+        if va_n > 0:
+            mean = va_alpha_sum / va_n
+            var = (va_alpha_sq / va_n - mean ** 2).clamp_min(0.0)
+            self._val_alpha_stats = {
+                "alpha": [float(v) for v in mean.tolist()],
+                "std": float(var.sqrt().mean().item()),
+                "main": [int(v) for v in va_main_counts.tolist()],
+                "n": int(va_n),
+            }
+        else:
+            self._val_alpha_stats = None
+
         return avg_valid_loss, valid_ppl, valid_acc
 
-    def nucleus_sampling(self, input_ids, token_type_ids, input_len):
+    def nucleus_sampling(self, input_ids, token_type_ids, input_len,
+                         imgs=None, auds=None, gated_weights=None, main_idx=None):
+        """自回归生成。imgs/auds/gated_weights/main_idx 为 None 时退化为纯文本生成。"""
         output_ids = []
         for pos in range(input_len, self.args.max_len):
-            outputs = self.model(input_ids=input_ids, token_type_ids=token_type_ids)
-            next_token_logits = outputs.logits[:, pos - 1, :]
+            outputs = self.model(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=torch.ones_like(input_ids),
+                imgs=imgs,
+                auds=auds,
+                gated_weights=gated_weights,
+                main_idx=main_idx,
+            )
+            # 融合分支会在序列最前面插入伪 token，因此用 -1 取最后一位，避免位置偏移
+            next_token_logits = outputs.logits[:, -1, :]
 
             probs = F.softmax(next_token_logits, dim=-1)
 
@@ -477,14 +669,96 @@ class Manager:
         torch.cuda.manual_seed_all(seed)
         random.seed(seed)
 
-    def _pool_text_feat(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """用 GPT-2 的 token embedding 做均值池化，得到 (B, E) 的轻量文本特征供 selector 使用。"""
+    @staticmethod
+    def _shift_for_lm(logits, labels):
+        """算 PPL 用的 shift_logits / shift_labels。
+
+        模态融合会在序列最前面插入 1 个伪 token（不参与语言建模），
+        此时 logits 比 labels 多一位，必须先把 labels 左侧补 -100 再 shift。
+        """
+        if logits.size(1) == labels.size(1) + 1:
+            labels = torch.cat([labels.new_full((labels.size(0), 1), -100), labels], dim=1)
+        elif logits.size(1) != labels.size(1):
+            n = min(logits.size(1), labels.size(1))
+            logits, labels = logits[:, -n:], labels[:, -n:]
+        return logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
+
+    def _attn_mask(self, input_ids):
+        """padding 位置为 0，其余为 1。pad_id 用 <bos>，不会和真实 token 冲突。"""
+        pad_id = getattr(self.args, 'pad_id', None)
+        if pad_id is None:
+            return None
+        return (input_ids != int(pad_id)).long()
+
+    def _per_sample_loss(self, out, lm_labels, emotion_labels):
+        """单样本的 L_lm + L_emo（token 维取均值），用于构造 richness 的边际贡献。"""
+        sl, st = self._shift_for_lm(out.logits, lm_labels)
+        lm = nn.functional.cross_entropy(
+            sl.reshape(-1, sl.size(-1)), st.reshape(-1),
+            reduction='none', ignore_index=-100,
+        ).view(sl.size(0), -1)
+        denom = (st != -100).view(st.size(0), -1).sum(1).clamp(min=1).float()
+        lm = lm.sum(1) / denom
+        em = nn.functional.cross_entropy(out.emotion_logits, emotion_labels, reduction='none')
+        return lm + em
+
+    def _richness_kl(self, input_ids, token_type_ids, lm_labels, emotion_labels,
+                     imgs, auds, gate, main_idx, base_out=None):
+        """方案 C：用"边际贡献"给 α 构造监督目标。
+
+            Δ_T = L(关闭融合) − L(全模态)
+            Δ_A = L(移除音频证据) − L(全模态)
+            Δ_V = L(移除视频证据) − L(全模态)
+            target = (1-s)·softmax(Δ/τ_r) + s/3
+            loss_rich = CE(target, α)
+
+        三次前向都在 no_grad 下完成（只需要标量目标），额外开销约 +1 个 forward。
+        """
+        with torch.no_grad():
+            base = self._per_sample_loss(base_out, lm_labels, emotion_labels)
+            forced = torch.zeros_like(main_idx)      # richness 估计统一用文本 hub，保证 Δ 语义一致
+            deltas = []
+            for ab in (3, 1, 2):
+                o = self.model(
+                    input_ids=input_ids, token_type_ids=token_type_ids,
+                    attention_mask=self._attn_mask(input_ids),
+                    labels=lm_labels, emotion_labels=emotion_labels,
+                    imgs=imgs, auds=auds,
+                    gated_weights=gate.detach(), main_idx=forced,
+                    ablate=ab,
+                )
+                deltas.append(self._per_sample_loss(o, lm_labels, emotion_labels) - base)
+            delta = torch.stack(deltas, dim=-1).clamp_min(0.0)          # (B,3)
+            target = torch.softmax(delta / max(1e-6, self.args.richness_tau), dim=-1)
+            s = float(self.args.richness_smooth)
+            target = (1.0 - s) * target + s / 3.0
+        logp = torch.log(gate.clamp_min(1e-8))
+        return -(target * logp).sum(dim=-1).mean()
+
+    def _pool_text_feat(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """用 GPT-2 的 token embedding 做均值池化，得到 (B, E) 的轻量文本特征供 selector 使用。
+
+        两个要点：
+          1) 只对真实 token 求均值（排除 padding），否则同一句在不同 batch 里特征不同；
+          2) 只池化到第一个 </s> 为止 —— input_ids 里还带着参考回复，把它算进 selector 特征
+             既稀释了上下文语义，也造成训练/推理分布不一致。
+        """
         with torch.no_grad():
             emb = self.model.transformer.wte(input_ids)  # (B, L, E)
-            feat = emb.mean(dim=1)  # (B, E)
+            if attention_mask is not None:
+                m = attention_mask.to(emb.device).float()
+            else:
+                m = torch.ones_like(input_ids, dtype=torch.float32)
+            # 上下文掩码：第一个 </s> 及其之前为 1
+            eos_id = getattr(self.args, "eos_id", None)
+            if eos_id is not None:
+                ctx_mask = ((input_ids == int(eos_id)).cumsum(dim=1) <= 1).float()
+                m = m * ctx_mask
+            m = m.unsqueeze(-1).to(emb.dtype)
+            feat = (emb * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
         return feat.float()
 
-    def _pool_modal_feat(self, x):
+    def _pool_modal_feat(self, x, mask: torch.Tensor = None):
         """
         Robust pooling utility for modal features.
 
@@ -498,6 +772,11 @@ class Manager:
         """
         if x is None:
             return None
+
+        # 有 attention mask 时按真实 token 长度池化，避免 padding 的 0 行稀释特征
+        if mask is not None and torch.is_tensor(x) and x.dim() == 3:
+            m = mask.to(x.device).unsqueeze(-1).to(x.dtype)
+            return ((x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)).float()
 
         # Helper: pool a single sample to 1D vector
         def _pool_one(item):
@@ -616,10 +895,12 @@ class Manager:
         sample_batch = next(iter(loader))
         input_ids, _, _, imgs, auds, _, _ = sample_batch
 
+        mask = self._attn_mask(input_ids)
         with torch.no_grad():
-            text_feat = self._pool_text_feat(input_ids.to(self.args.device))
-        audio_feat = self._pool_modal_feat(auds)
-        video_feat = self._pool_modal_feat(imgs)
+            text_feat = self._pool_text_feat(input_ids.to(self.args.device),
+                                             mask.to(self.args.device) if mask is not None else None)
+        audio_feat = self._pool_modal_feat(auds, mask)
+        video_feat = self._pool_modal_feat(imgs, mask)
 
         audio_dim = audio_feat.shape[-1] if audio_feat is not None else 0
         video_dim = video_feat.shape[-1] if video_feat is not None else 0
@@ -632,12 +913,16 @@ class Manager:
 
         cfg = SelectorConfig(
             input_dim=input_dim,
-            hidden_dim=input_dim,
+            hidden_dim=self.args.selector_hidden_dim,
             num_layers=self.args.selector_num_layers,
             dropout=self.args.selector_dropout,
             mode="continuous",
             num_actions=3,
             num_modalities=3,
+            # 传入各模态维度 -> 三塔各自编码自己的模态（否则回退到共享 backbone）
+            d_text=int(text_dim),
+            d_audio=int(audio_dim),
+            d_video=int(video_dim),
         )
         self.selector = build_selector("GatedTriTower", cfg).to(self.args.device)
 
@@ -668,17 +953,25 @@ class Manager:
         if self.selector is None:
             return None, None
 
-        text_feat = self._pool_text_feat(input_ids)  # (B, E)
-        audio_feat = self._pool_modal_feat(auds)
-        video_feat = self._pool_modal_feat(imgs)
+        mask = self._attn_mask(input_ids)
+        text_feat = self._pool_text_feat(input_ids, mask)  # (B, E)
+        audio_feat = self._pool_modal_feat(auds, mask)
+        video_feat = self._pool_modal_feat(imgs, mask)
 
         states = _build_states(text_feat.to(self.args.device), audio_feat.to(self.args.device) if audio_feat is not None else None,
                                video_feat.to(self.args.device) if video_feat is not None else None)
-        sel_out = self.selector(states)
+        # τ 温度：直接作用于 selector 的 gate logits（论文 Eq.6）。
+        # τ=None / 1.0 时与旧行为完全一致；训练与推理都会生效。
+        tau = getattr(self.args, 'tau', None)
+        try:
+            sel_out = self.selector(states, tau=tau)
+        except TypeError:
+            # 兼容不接受 tau 的 selector 实现
+            sel_out = self.selector(states)
         gate = sel_out.get("gate")
         if gate is None:
-            tau = getattr(self.args, 'tau', None) or 1.0
-            gate = torch.softmax(sel_out["logits"] / float(max(1e-6, tau)), dim=-1)
+            tau_val = float(tau) if (tau is not None and float(tau) > 0) else 1.0
+            gate = torch.softmax(sel_out["logits"] / tau_val, dim=-1)
 
         main_idx = torch.argmax(gate, dim=-1)  # (B,)
         return gate, main_idx
@@ -714,15 +1007,33 @@ class Manager:
                     lm_labels.to(self.args.device),
                     torch.LongTensor(emotion_labels).to(self.args.device),
                 )
+                imgs = imgs.to(self.args.device, dtype=torch.float32) if imgs is not None else None
+                auds = auds.to(self.args.device, dtype=torch.float32) if auds is not None else None
+
+                gate, main_idx = self._selector_forward(input_ids, imgs, auds)
 
                 for i in range(input_ids.size(0)):
                     current_input = input_ids[i].unsqueeze(0)
                     current_token_types = token_type_ids[i].unsqueeze(0)
 
-                    input_len = (current_input != self.args.eos_id).sum().item()
+                    # 生成前缀 = 上下文 + 结尾的 </s>。
+                    # 注意：不能用 (input_ids != eos).sum()，那样会把参考回复也数进去，
+                    # 等于把参考答案喂给模型（会严重高估 BERTScore）。
+                    eos_pos = (current_input[0] == self.args.eos_id).nonzero(as_tuple=True)[0]
+                    if eos_pos.numel() > 0:
+                        input_len = int(eos_pos[0].item()) + 1
+                    else:
+                        input_len = int((current_input != self.args.pad_id).sum().item())
+                    input_len = min(input_len, current_input.size(1))
+
+                    sample_img = imgs[i:i + 1, :input_len] if imgs is not None else None
+                    sample_aud = auds[i:i + 1, :input_len] if auds is not None else None
 
                     output_ids = self.nucleus_sampling(current_input[:, :input_len], current_token_types[:, :input_len],
-                                                       input_len)
+                                                       input_len,
+                                                       imgs=sample_img, auds=sample_aud,
+                                                       gated_weights=(gate[i:i + 1] if gate is not None else None),
+                                                       main_idx=(main_idx[i:i + 1] if main_idx is not None else None))
                     hypothesis_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
                     print("hyp: ", hypothesis_text)
                     all_hypotheses.append(hypothesis_text)
@@ -733,11 +1044,10 @@ class Manager:
 
                     all_true_labels.append(emotion_labels[i].item())
 
-                gate, main_idx = self._selector_forward(input_ids, imgs, auds)
-
                 outputs = self.model(
                     input_ids=input_ids,
                     token_type_ids=token_type_ids,
+                    attention_mask=self._attn_mask(input_ids),
                     labels=lm_labels,
                     emotion_labels=emotion_labels,
                     imgs=imgs,
@@ -766,8 +1076,7 @@ class Manager:
                             "reference": all_references[base + i] if base + i < len(all_references) else "",
                         })
 
-                shift_logits = outputs.logits[..., :-1, :].contiguous()
-                shift_labels = lm_labels[..., 1:].contiguous()
+                shift_logits, shift_labels = self._shift_for_lm(outputs.logits, lm_labels)
                 loss_fct_lm = nn.CrossEntropyLoss()
                 lm_loss = loss_fct_lm(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 all_losses.append(lm_loss.item())
@@ -791,6 +1100,22 @@ if __name__ == "__main__":
     parser.add_argument("--sp2_token", type=str, default="<sp2>", help="The speaker2 token.")
     parser.add_argument("--gpu", type=str, default="0", help="The index of GPU to use.")
     parser.add_argument("--lr", type=float, default=2e-5, help="The learning rate.")
+    parser.add_argument("--new_module_lr", type=float, default=1e-3,
+                        help="LR for newly initialized modules (fusion / emotion head / selector).")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Gradient clipping max-norm (<=0 disables).")
+    parser.add_argument("--richness_lambda", type=float, default=0.1,
+                        help="Weight λ of the richness KL term (<=0 disables, reverts to plain LM+emo).")
+    parser.add_argument("--richness_tau", type=float, default=0.5,
+                        help="Temperature τ_r: target = softmax(Δ/τ_r).")
+    parser.add_argument("--richness_smooth", type=float, default=0.1,
+                        help="Mix ratio of the uniform distribution into the richness target.")
+    parser.add_argument("--richness_every", type=int, default=1,
+                        help="Estimate the richness target every N steps (cost saving).")
+    parser.add_argument("--richness_warmup_steps", type=int, default=500,
+                        help="Linearly ramp the richness weight lambda over the first N steps.")
+    parser.add_argument("--aux_floor", type=float, default=0.05,
+                        help="Floor added to auxiliary α before within-auxiliary renormalization.")
     parser.add_argument("--warmup_ratio", type=float, default=0.1,
                         help="The ratio of warmup steps to the total training steps.")
     parser.add_argument("--selector_hidden_dim", type=int, default=768, help="Hidden size for GatedTriTowerSelector.")
@@ -902,7 +1227,22 @@ if __name__ == "__main__":
                 print(f"{metric.upper():<10}: {value}")
         print("--------------------------------")
 
+        os.makedirs(args.data_dir, exist_ok=True)
         results_file_path = os.path.join(args.data_dir, f"{args.ckpt_name}_evaluation_results.txt")
         with open(results_file_path, "w", encoding="utf-8") as f:
             for metric, value in final_metrics.items():
                 f.write(f"{metric}: {value}\n")
+
+        # 供 analysis/tau_sensitivity_plot.py 读取（它期望 <output_dir>/metrics.json）
+        metrics_payload = {
+            "ppl": float(test_ppl),
+            "bertscore": float(final_metrics.get("f1", float("nan"))),
+            "emo_acc": float(test_acc),
+            "dist_1": float(final_metrics.get("dist_1", float("nan"))),
+            "dist_2": float(final_metrics.get("dist_2", float("nan"))),
+            "tau": float(args.tau) if getattr(args, "tau", None) else 1.0,
+        }
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(metrics_payload, f, ensure_ascii=False, indent=2)
+        print(f"[Metrics] saved to {os.path.join(args.output_dir, 'metrics.json')}")

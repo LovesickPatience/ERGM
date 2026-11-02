@@ -213,26 +213,70 @@ class PadCollate():
                 label_text = b.get('label_text', '')
                 contexts.append(b.get('contexts', b.get('ctx_text', '')))
 
-                # --- tokenize context (ctx) ---
-                enc_ctx = tokenizer(
-                    ctx_text,
-                    padding=False,
-                    truncation=True,
-                    max_length=max_len,
-                    add_special_tokens=False,
-                    return_tensors='pt'
-                )
-                ids_ctx = enc_ctx.input_ids[0].to(torch.long)
+                # ---- context: 逐句 tokenize，让每个 token 携带"所属那句话"的音视频特征 ----
+                utt_texts = b.get('ctx_utt_texts') or None
+                sp_toks = b.get('ctx_speaker_tokens') or []
+                ctx_a = b.get('ctx_audio', b.get('audio_feats', None))
+                ctx_v = b.get('ctx_video', b.get('video_feats', None))
+                a_dim_local = int(ctx_a.size(-1)) if (torch.is_tensor(ctx_a) and ctx_a.numel() > 0) else 0
+                v_dim_local = int(ctx_v.size(-1)) if (torch.is_tensor(ctx_v) and ctx_v.numel() > 0) else 0
 
-                # build token_type_ids for ctx by scanning speaker tokens
-                cur_sp = sp1_id
-                tt_ctx = torch.empty_like(ids_ctx)
-                for k, tid in enumerate(ids_ctx.tolist()):
-                    if sp1_tid is not None and tid == sp1_tid:
-                        cur_sp = sp1_id
-                    elif sp2_tid is not None and tid == sp2_tid:
-                        cur_sp = sp2_id
-                    tt_ctx[k] = cur_sp
+                ids_parts, tt_parts, a_parts, v_parts = [], [], [], []
+                if utt_texts:
+                    for k, utext in enumerate(utt_texts):
+                        sp = str(sp_toks[k]) if k < len(sp_toks) else sp1_tok
+                        cur_sp_id = sp2_id if sp == sp2_tok else sp1_id
+                        piece = f"{sp} {(utext or '').strip()}"
+                        enc_u = tokenizer(
+                            piece, padding=False, truncation=True, max_length=max_len,
+                            add_special_tokens=False, return_tensors='pt'
+                        )
+                        pid = enc_u.input_ids[0].to(torch.long)
+                        if pid.numel() == 0:
+                            continue
+                        ids_parts.append(pid)
+                        tt_parts.append(torch.full((pid.size(0),), cur_sp_id, dtype=torch.long))
+                        if a_dim_local > 0:
+                            fa = ctx_a[k] if k < ctx_a.size(0) else torch.zeros(a_dim_local)
+                            a_parts.append(fa.to(torch.float32).unsqueeze(0).expand(pid.size(0), -1))
+                        if v_dim_local > 0:
+                            fv = ctx_v[k] if k < ctx_v.size(0) else torch.zeros(v_dim_local)
+                            v_parts.append(fv.to(torch.float32).unsqueeze(0).expand(pid.size(0), -1))
+                    ids_ctx = torch.cat(ids_parts, dim=0) if ids_parts else torch.zeros(0, dtype=torch.long)
+                    tt_ctx = torch.cat(tt_parts, dim=0) if tt_parts else torch.zeros(0, dtype=torch.long)
+                    af_tok = torch.cat(a_parts, dim=0) if a_parts else torch.zeros(0, a_dim_local)
+                    vf_tok = torch.cat(v_parts, dim=0) if v_parts else torch.zeros(0, v_dim_local)
+                else:
+                    # 回退路径：整段 tokenize + 单个池化向量广播到所有 token
+                    enc_ctx = tokenizer(
+                        ctx_text, padding=False, truncation=True, max_length=max_len,
+                        add_special_tokens=False, return_tensors='pt'
+                    )
+                    ids_ctx = enc_ctx.input_ids[0].to(torch.long)
+                    cur_sp = sp1_id
+                    tt_ctx = torch.empty_like(ids_ctx)
+                    for k, tid in enumerate(ids_ctx.tolist()):
+                        if sp1_tid is not None and tid == sp1_tid:
+                            cur_sp = sp1_id
+                        elif sp2_tid is not None and tid == sp2_tid:
+                            cur_sp = sp2_id
+                        tt_ctx[k] = cur_sp
+                    af_g = _stack_1d(b['audio_feats']) if b.get('audio_feats') is not None else None
+                    vf_g = _stack_1d(b['video_feats']) if b.get('video_feats') is not None else None
+                    a_dim_local = int(af_g.size(-1)) if af_g is not None else a_dim
+                    v_dim_local = int(vf_g.size(-1)) if vf_g is not None else v_dim
+                    af_g = af_g if af_g is not None else torch.zeros(a_dim_local)
+                    vf_g = vf_g if vf_g is not None else torch.zeros(v_dim_local)
+                    af_tok = af_g.unsqueeze(0).expand(ids_ctx.size(0), -1)
+                    vf_tok = vf_g.unsqueeze(0).expand(ids_ctx.size(0), -1)
+
+                # 上下文末尾补一个 </s> 作为分隔（原来由 ctx_text 自带）
+                if eos_id is not None:
+                    ids_ctx = torch.cat([ids_ctx, torch.tensor([int(eos_id)], dtype=torch.long)], dim=0)
+                    tail_sp = tt_ctx[-1:] if tt_ctx.numel() > 0 else torch.tensor([sp1_id], dtype=torch.long)
+                    tt_ctx = torch.cat([tt_ctx, tail_sp.to(torch.long)], dim=0)
+                    af_tok = torch.cat([af_tok, torch.zeros(1, a_dim_local, dtype=torch.float32)], dim=0)
+                    vf_tok = torch.cat([vf_tok, torch.zeros(1, v_dim_local, dtype=torch.float32)], dim=0)
 
                 # --- tokenize response (resp) ---
                 enc_resp = tokenizer(
@@ -246,11 +290,14 @@ class PadCollate():
                 ids_resp = enc_resp.input_ids[0].to(torch.long)
 
                 # --- build prefix placeholders: [<img>, <aud>] (skip if missing in vocab) ---
+                # RaMRA 通过融合模块注入模态，不需要这两个占位 token；
+                # 由 args.emit_placeholders 控制（baseline 仍需要）。
                 prefix_tokens = []
-                if img_tid is not None:
-                    prefix_tokens.append(img_tid)
-                if aud_tid is not None:
-                    prefix_tokens.append(aud_tid)
+                if getattr(self.args, 'emit_placeholders', True):
+                    if img_tid is not None:
+                        prefix_tokens.append(img_tid)
+                    if aud_tid is not None:
+                        prefix_tokens.append(aud_tid)
                 prefix_ids = torch.tensor(prefix_tokens, dtype=torch.long)
 
                 # token types for prefix: use sp1_id as neutral speaker id
@@ -262,14 +309,18 @@ class PadCollate():
                 if total_len > max_len:
                     overflow = total_len - max_len
                     if overflow <= ids_ctx.size(0):
-                        # trim ctx from left
+                        # trim ctx from left（特征行同步裁剪，保持 token↔特征对齐）
                         ids_ctx = ids_ctx[overflow:]
                         tt_ctx = tt_ctx[overflow:]
+                        af_tok = af_tok[overflow:]
+                        vf_tok = vf_tok[overflow:]
                     else:
                         # remove ctx entirely, trim resp from left
                         overflow2 = overflow - ids_ctx.size(0)
                         ids_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
-                        tt_ctx = ids_ctx.new_zeros((0,), dtype=torch.long)
+                        tt_ctx = tt_ctx.new_zeros((0,), dtype=torch.long)
+                        af_tok = af_tok[:0]
+                        vf_tok = vf_tok[:0]
                         if overflow2 < ids_resp.size(0):
                             ids_resp = ids_resp[overflow2:]
                         else:
@@ -277,11 +328,13 @@ class PadCollate():
                             ids_resp = ids_resp[-1:].clone()
 
                 # --- concat inputs; labels only supervise response ---
+                resp_len = ids_resp.size(0)
                 input_ids_full = torch.cat([prefix_ids, ids_ctx, ids_resp], dim=0)
                 tt_full = torch.cat([
                     tt_prefix,
                     tt_ctx,
-                    (tt_ctx[-1:] if tt_ctx.numel() > 0 else torch.tensor([sp1_id], dtype=torch.long)).repeat(ids_resp.size(0))
+                    (tt_ctx[-1:] if tt_ctx.numel() > 0 else torch.tensor([sp1_id], dtype=torch.long))
+                    .repeat(resp_len).to(torch.long)
                 ], dim=0)
 
                 labels_full = torch.cat([
@@ -289,39 +342,52 @@ class PadCollate():
                     ids_resp.clone()
                 ], dim=0)
 
+                # 逐 token 对齐的模态特征：<img>/<aud> 占位与 response 位置填 0（纯文本）
+                af_full = torch.cat([
+                    torch.zeros(prefix_ids.size(0), a_dim_local, dtype=torch.float32),
+                    af_tok.to(torch.float32),
+                    torch.zeros(resp_len, a_dim_local, dtype=torch.float32),
+                ], dim=0)
+                vf_full = torch.cat([
+                    torch.zeros(prefix_ids.size(0), v_dim_local, dtype=torch.float32),
+                    vf_tok.to(torch.float32),
+                    torch.zeros(resp_len, v_dim_local, dtype=torch.float32),
+                ], dim=0)
+
                 input_ids_list.append(input_ids_full)
                 token_type_ids_list.append(tt_full)
                 labels_list.append(labels_full)
-
-                # Audio/Video features → (D,) then repeat per-token to align with ERGM expectation
-                # ---- audio ----
-                af_src = b['audio_feats'] if ('audio_feats' in b and b['audio_feats'] is not None) else b.get(
-                    'audio_feat', None)
-                if af_src is None:
-                    af = torch.zeros(a_dim, dtype=torch.float32)
-                else:
-                    af = _stack_1d(af_src)
-
-                # ---- video ----
-                vf_src = b['video_feats'] if ('video_feats' in b and b['video_feats'] is not None) else b.get(
-                    'video_feat', None)
-                if vf_src is None:
-                    vf = torch.zeros(v_dim, dtype=torch.float32)
-                else:
-                    vf = _stack_1d(vf_src)
-                seq_len = input_ids_full.size(0)
-                imgs.append([vf.clone() for _ in range(seq_len)])
-                auds.append([af.clone() for _ in range(seq_len)])
+                auds.append(af_full)
+                imgs.append(vf_full)
 
                 emo_label_val = b.get('emotion_label', None)
                 if emo_label_val is None:
                     emo_label_val = _EMO_MAP.get(str(b.get('erc_label_text', 'neu')).lower(), 0)
                 emotion_labels.append(int(emo_label_val))
 
-            # Pad sequences across batch
-            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=eos_id)
+            # Pad sequences across batch.
+            # pad 用 <bos>（IEMOCAP 序列里从不出现该 token），这样 attention_mask 可以直接由
+            # (input_ids != pad_id) 得到，而不会误伤上下文末尾真正的 </s>。
+            pad_id = getattr(self.args, 'pad_id', None)
+            pad_id = int(pad_id if pad_id is not None else eos_id)
+            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
             token_type_ids = torch.nn.utils.rnn.pad_sequence(token_type_ids_list, batch_first=True, padding_value=sp1_id)
             labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+
+            def _stack_rows(rows):
+                """把每样本的 (L, D) 特征堆成 (B, Lmax, D)，长度维补 0。"""
+                if not rows:
+                    return None
+                D = max(r.size(-1) for r in rows)
+                fixed = []
+                for r in rows:
+                    if r.size(-1) < D:
+                        r = torch.cat([r, torch.zeros(r.size(0), D - r.size(-1), dtype=r.dtype)], dim=1)
+                    fixed.append(r.to(torch.float32))
+                return torch.nn.utils.rnn.pad_sequence(fixed, batch_first=True, padding_value=0.0)
+
+            imgs = _stack_rows(imgs)
+            auds = _stack_rows(auds)
 
             return (
                 input_ids,

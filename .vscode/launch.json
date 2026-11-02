@@ -1,0 +1,73 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ERGM 训练 (gpt2-medium / IEMOCAP 风格 ERGM 分支)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/main.py",
+      "python": "D:\\Anaconda\\Anaconda3\\envs\\ergm\\python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "HF_ENDPOINT": "https://hf-mirror.com"
+      },
+      "args": [
+        "--seed=0",
+        "--mode=train",
+        "--dataset=ERGM",
+        "--data_dir=data",
+        "--train_prefix=train",
+        "--valid_prefix=test",
+        "--model_type=gpt2-medium",
+        "--bos_token=<bos>",
+        "--sp1_token=<sp1>",
+        "--sp2_token=<sp2>",
+        "--gpu=0",
+        "--lr=1e-5",
+        "--warmup_ratio=0.0",
+        "--batch_size=4",
+        "--num_workers=0",
+        "--num_epochs=100",
+        "--max_len=1024",
+        "--layers=0"
+      ]
+    },
+    {
+      "name": "ERGM 冒烟测试 (1 epoch / batch 1 / 短序列)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/main.py",
+      "python": "D:\\Anaconda\\Anaconda3\\envs\\ergm\\python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "HF_ENDPOINT": "https://hf-mirror.com"
+      },
+      "args": [
+        "--seed=0",
+        "--mode=train",
+        "--dataset=ERGM",
+        "--data_dir=data",
+        "--train_prefix=train",
+        "--valid_prefix=test",
+        "--model_type=gpt2-medium",
+        "--bos_token=<bos>",
+        "--sp1_token=<sp1>",
+        "--sp2_token=<sp2>",
+        "--gpu=0",
+        "--lr=1e-5",
+        "--warmup_ratio=0.0",
+        "--batch_size=1",
+        "--num_workers=0",
+        "--num_epochs=1",
+        "--max_len=256",
+        "--layers=0"
+      ]
+    }
+  ]
+}

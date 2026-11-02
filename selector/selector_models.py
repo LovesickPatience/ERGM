@@ -14,6 +14,10 @@ class SelectorConfig:
     mode: str = "discrete"        # "discrete" or "continuous"
     num_actions: int = 3           # required if mode == "discrete"
     num_modalities: int = 3        # required if mode == "continuous" (e.g., T/A/V)
+    # 各模态的原始特征维度；三者都给定时，GatedTriTower 使用"三塔各自吃自己模态"的结构
+    d_text: int = None
+    d_audio: int = None
+    d_video: int = None
 
 
 @dataclass
@@ -135,82 +139,132 @@ class TriTowerSelector(nn.Module):
 
 class GatedTriTowerSelector(BaseSelector):
     """
-    三塔 + gated attention 的 selector：
+    三塔门控 selector（RaMRA 的 MRD）。
 
-    - 输入: states 形状 (B, input_dim)，通常是 [text_feat; audio_feat; video_feat; ...] 拼接
-    - 先过一个共享 backbone 得到 h_shared (B, H)
-    - 三个塔分别从 h_shared 中提取模态专属向量 h_T, h_A, h_V
-    - gate_net(h_T, h_A, h_V) 得到每个模态的 gate logit，softmax 后得到权重 (B,3)
-    - 融合向量 h_fused = Σ_i gate_i * h_i
-    - 最后 logits = out(h_fused) 作为对动作集合的打分
+    推荐结构（cfg 同时给出 d_text/d_audio/d_video 时启用）：
+      1) 三个**相互独立**的模态塔（每个塔只吃自己的模态）：
+             h_m = φ(LN(W_m x_m + b_m))                      （论文 Eq.2）
+      2) 乘性门控，逐维度抑制不可靠通道：
+             g_m = σ(W^g_m x_m + b^g_m),  h̃_m = g_m ⊙ h_m     （论文 Eq.3-4）
+      3) 另加一路**全局上下文**编码（只喂给 GateNet，不参与 α 的维度）：
+             h_ctx = MLP([x_T ; x_A ; x_V])
+         这样 gate 既能看到单模态证据，也能看到跨模态上下文，而三个塔本身不被混合污染。
+      4) GateNet + 温度归一化：
+             κ = GateNet([h̃_T ; h̃_A ; h̃_V ; h_ctx]) ∈ R^3
+             α = softmax(κ / τ)                              （论文 Eq.6）
+      5) 融合：h_fused = Σ_m α_m h̃_m,  logits = out(h_fused)
+
+    回退结构（未提供模态维度时）：共享 backbone + 三个线性头，仅为向后兼容。
     """
 
     def __init__(self, cfg: SelectorConfig):
         super().__init__()
         self.cfg = cfg
         H = cfg.hidden_dim
-
-        # 1) 共享 backbone：把所有模态拼接后的 states 编成一个通用表示
-        self.backbone = MLP(
-            in_dim=cfg.input_dim,
-            hidden_dim=cfg.hidden_dim,
-            out_dim=cfg.hidden_dim,
-            num_layers=cfg.num_layers,
-            dropout=cfg.dropout,
+        self.d_text, self.d_audio, self.d_video = cfg.d_text, cfg.d_audio, cfg.d_video
+        self.use_modality_inputs = all(
+            d is not None and int(d) > 0 for d in (self.d_text, self.d_audio, self.d_video)
         )
 
-        # 2) 三个塔：在 shared 表示上再加一层投影，得到三种“模态专属”向量
-        self.text_head = nn.Linear(H, H)
-        self.audio_head = nn.Linear(H, H)
-        self.video_head = nn.Linear(H, H)
+        if self.use_modality_inputs:
+            self.d_text, self.d_audio, self.d_video = int(self.d_text), int(self.d_audio), int(self.d_video)
+            # 1) 三个独立的模态塔
+            self.tower_text = self._make_tower(self.d_text, H, cfg.dropout)
+            self.tower_audio = self._make_tower(self.d_audio, H, cfg.dropout)
+            self.tower_video = self._make_tower(self.d_video, H, cfg.dropout)
+            # 2) 逐维乘性门控
+            self.gate_text = nn.Linear(self.d_text, H)
+            self.gate_audio = nn.Linear(self.d_audio, H)
+            self.gate_video = nn.Linear(self.d_video, H)
+            # 3) 第四路：全局上下文（跨模态），只提供给 GateNet
+            self.ctx_enc = MLP(
+                in_dim=cfg.input_dim,
+                hidden_dim=H,
+                out_dim=H,
+                num_layers=max(2, cfg.num_layers),
+                dropout=cfg.dropout,
+            )
+            # 4) GateNet: 4 路 -> 3 个模态 logit
+            self.gate_net = nn.Sequential(
+                nn.Linear(H * 4, H),
+                nn.Tanh(),
+                nn.Linear(H, 3),
+            )
+        else:
+            # 回退：旧的共享 backbone 结构
+            self.backbone = MLP(
+                in_dim=cfg.input_dim,
+                hidden_dim=H,
+                out_dim=H,
+                num_layers=cfg.num_layers,
+                dropout=cfg.dropout,
+            )
+            self.text_head = nn.Linear(H, H)
+            self.audio_head = nn.Linear(H, H)
+            self.video_head = nn.Linear(H, H)
+            self.gate_net = nn.Sequential(
+                nn.Linear(H * 3, H),
+                nn.Tanh(),
+                nn.Linear(H, 3),
+            )
 
-        # 3) gate 网络：从三路特征拼接得到 (B,3) 的 gate logits
-        #    gated attention: gate = softmax(gate_logits)
-        self.gate_net = nn.Sequential(
-            nn.Linear(H * 3, H),
-            nn.Tanh(),
-            nn.Linear(H, 3)   # 对应 3 个模态的 gate logit
-        )
-
-        # 4) 输出头：对融合后的表示打分，得到 num_actions 维 logits
+        # 5) 输出头
         self.out = nn.Linear(H, cfg.num_actions)
 
-    def forward(self, states: torch.Tensor) -> Dict[str, torch.Tensor]:
+    @staticmethod
+    def _make_tower(in_dim: int, hidden: int, dropout: float) -> nn.Module:
+        """单模态塔：LN(W x + b) -> 非线性（论文 Eq.2）。"""
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def _split_states(self, states: torch.Tensor):
+        """从拼接特征中切出三个模态（顺序 = _build_states: text, audio, video）。"""
+        d_t, d_a = self.d_text, self.d_audio
+        x_t = states[:, :d_t]
+        x_a = states[:, d_t:d_t + d_a]
+        x_v = states[:, d_t + d_a:d_t + d_a + self.d_video]
+        return x_t, x_a, x_v
+
+    def forward(self, states: torch.Tensor, tau: Optional[float] = None) -> Dict[str, torch.Tensor]:
         """
         Args:
-            states: (B, input_dim)，通常是 [tf; af; vf; hc] 这种拼接后的特征
+            states: (B, input_dim) = [text_feat ; audio_feat ; video_feat]
+            tau:    温度系数 τ（论文 Eq.6），作用于 gate logits。None / 1.0 等价于原行为。
         Returns:
-            dict: {
-              "logits": (B, num_actions),
-              "gate":   (B, 3)  # 每个模态的 gate 权重，便于可视化/分析
-            }
+            dict: {"logits": (B, num_actions), "gate": (B, 3), "gate_logits": (B, 3)}
         """
-        # 1) 共享编码
-        h_shared = self.backbone(states)          # (B, H)
+        tau_val = float(tau) if (tau is not None and float(tau) > 0) else 1.0
 
-        # 2) 三个模态塔
-        h_t = torch.tanh(self.text_head(h_shared))   # (B, H)
-        h_a = torch.tanh(self.audio_head(h_shared))  # (B, H)
-        h_v = torch.tanh(self.video_head(h_shared))  # (B, H)
+        if self.use_modality_inputs:
+            x_t, x_a, x_v = self._split_states(states)
+            h_t = self.gate_text(x_t).sigmoid() * self.tower_text(x_t)
+            h_a = self.gate_audio(x_a).sigmoid() * self.tower_audio(x_a)
+            h_v = self.gate_video(x_v).sigmoid() * self.tower_video(x_v)
+            h_ctx = self.ctx_enc(states)
+            gate_in = torch.cat([h_t, h_a, h_v, h_ctx], dim=-1)   # (B, 4H)
+        else:
+            h_shared = self.backbone(states)
+            h_t = torch.tanh(self.text_head(h_shared))
+            h_a = torch.tanh(self.audio_head(h_shared))
+            h_v = torch.tanh(self.video_head(h_shared))
+            gate_in = torch.cat([h_t, h_a, h_v], dim=-1)          # (B, 3H)
 
-        # 3) gated attention：根据三个模态的特征，学习一个 softmax gate
-        #    先拼接 -> (B, 3H) -> gate_logits (B,3) -> gate_weights (B,3)
-        h_cat = torch.cat([h_t, h_a, h_v], dim=-1)   # (B, 3H)
-        gate_logits = self.gate_net(h_cat)          # (B, 3)
-        gate_weights = F.softmax(gate_logits, dim=-1)  # (B, 3)
+        gate_logits = self.gate_net(gate_in)                      # (B, 3)
+        gate_weights = F.softmax(gate_logits / tau_val, dim=-1)   # (B, 3) = α
 
-        # 4) 用 gate 权重对三路特征做加权求和，得到融合向量
-        #    先堆叠成 (B, 3, H)，再按模态维度加权
-        h_stack = torch.stack([h_t, h_a, h_v], dim=1)          # (B, 3, H)
-        gate_exp = gate_weights.unsqueeze(-1)                  # (B, 3, 1)
-        h_fused = (gate_exp * h_stack).sum(dim=1)              # (B, H)
+        h_stack = torch.stack([h_t, h_a, h_v], dim=1)             # (B, 3, H)
+        h_fused = (gate_weights.unsqueeze(-1) * h_stack).sum(dim=1)
 
-        # 5) 输出动作用 logits
-        logits = self.out(h_fused)                             # (B, num_actions)
+        logits = self.out(h_fused)                                # (B, num_actions)
 
         return {
             "logits": logits,
-            "gate": gate_weights,   # 方便你 later 可视化看 selector 偏好哪种模态
+            "gate": gate_weights,
+            "gate_logits": gate_logits,
         }
 
 
